@@ -7,6 +7,8 @@ import (
     node "github.com/curusarn/distributed-system-hw/node"
 )
 
+var N *node.Node
+
 func main() {
     var ip string
     flag.StringVar(&ip, "ip", "127.0.0.1",
@@ -27,7 +29,6 @@ func main() {
     flag.Parse()
 
     n := node.New(ip, port)
-    node.N = &n
     if initCluster {
         fmt.Println("Hello, init cluster!")
         n.LeaderUid = n.Uid // set yourself as leader

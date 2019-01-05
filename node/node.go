@@ -14,7 +14,9 @@ import (
 
 const heartbeatTimeout time.Duration = 3000 * time.Millisecond
 
-type NodeRpc int
+type NodeRpc struct {
+    Node *Node
+}
 
 type Node struct {
     // const
@@ -32,11 +34,9 @@ type Node struct {
 
     HeartbeatTs time.Time
 
-    Rpc NodeRpc
+    X int
     // topologyBroken bool ??
 }
-
-var N *Node
 
 func getUID(ip string, port int) int64 {
     ipSlice := strings.Split(ip, ".")
@@ -70,10 +70,15 @@ func New(ip string, port int) Node {
     return n
 }
 
-func (r NodeRpc) RpcHeartbeat(arg bool, reply *bool) error {
-    N.HeartbeatTs = time.Now()
+func (r *NodeRpc) RpcHeartbeat(arg bool, reply *bool) error {
+    r.Node.HeartbeatTs = time.Now()
+    r.Node.X = 1
     fmt.Println("got hb at")
-    fmt.Println(N.HeartbeatTs)
+    fmt.Println(r.Node.HeartbeatTs)
+    return nil
+}
+
+func (r *NodeRpc) NonRpcFunc(arg bool) error {
     return nil
 }
 
@@ -92,11 +97,11 @@ func (n Node) SendHeartbeat() {
     fmt.Println(time.Now())
 }
 
-func (n Node) HeartbeatChecker() {
-    N.HeartbeatTs = time.Now() // init
+func (n *Node) HeartbeatChecker() {
+    n.HeartbeatTs = time.Now() // init
     for {
         time.Sleep(heartbeatTimeout)
-        ts := N.HeartbeatTs
+        ts := n.HeartbeatTs
         fmt.Println("checking hb expiration at")
         fmt.Println(time.Now())
         fmt.Println("> last hb at")
@@ -105,13 +110,26 @@ func (n Node) HeartbeatChecker() {
         heartbeatExpiration := ts.Add(heartbeatTimeout)
         fmt.Println(heartbeatExpiration)
         if time.Now().After(heartbeatExpiration) {
-            N.RepairTopology()
+            n.RepairTopology()
         }
     }
 }
 
-func (n Node) Listen() {
-    rpc.Register(n.Rpc)
+func Watch(r *NodeRpc) {
+    for {
+        t := 2000 * time.Millisecond
+        time.Sleep(t)
+        fmt.Println("X:")
+        fmt.Println(r.Node.X)
+    }
+}
+
+func (n *Node) Listen() {
+    r := &NodeRpc {
+        Node: n,
+    }
+    r.Node.X = 0
+    rpc.Register(r)
     rpc.HandleHTTP()
     l, e := net.Listen("tcp", ":42420")
     if e != nil {
@@ -119,6 +137,7 @@ func (n Node) Listen() {
         fmt.Println("listen error:", e)
     }
     go http.Serve(l, nil)
+    go Watch(r)
 }
 
 func (n Node) RepairTopology() {

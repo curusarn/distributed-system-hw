@@ -54,8 +54,7 @@ func main() {
     if initCluster {
         fmt.Println("Init cluster!")
         n.InitCluster()
-        n.Listen()
-        n.DialNeighbour()
+        go n.HeartbeatChecker()
         n.Run()
     } else if join != "" {
         fmt.Println("Join cluster:")
@@ -63,6 +62,7 @@ func main() {
 
         n.Listen()
         n.Join(join)
+        go n.HeartbeatChecker()
         if xxx {
             n.RunLeave()
         } else {

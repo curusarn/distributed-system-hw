@@ -9,9 +9,13 @@ import (
     "log"
     "net/http"
     "net"
+    "errors"
+    "sync"
 )
 
-const heartbeatTimeout time.Duration = 3000 * time.Millisecond
+const heartbeatTimeout time.Duration = 5 * time.Second
+const retryDelay time.Duration = 100 * time.Millisecond
+const retryCount int = 3
 
 type NodeInfo struct {
     Uid int64
@@ -30,9 +34,9 @@ type NodeRpc struct {
     Node *node
 }
 
-func (r *NodeRpc) Heartbeat(arg bool, reply *bool) error {
+func (r *NodeRpc) Heartbeat(_ bool, _ *bool) error {
     r.Node.heartbeatTs = time.Now()
-    log.Print("got hb")
+    log.Print("Recieved Heartbeat")
     return nil
 }
 
@@ -41,9 +45,11 @@ func (r *NodeRpc) Join(info NodeInfo, reply *NodeInfo) error {
     log.Print(info.Addr)
     // what if I do not have a neighbour ?
     reply.Uid = 0
+    r.Node.LockMtx()
     reply.Addr = r.Node.neighbourAddr
     r.Node.neighbourAddr = info.Addr
     r.Node.DialNeighbour()
+    r.Node.UnlockMtx()
     return nil
 }
 
@@ -52,11 +58,30 @@ func (r *NodeRpc) Leave(info TwoNodeInfo, reply *bool) error {
     log.Print(info.Addr)
     // what if I do not have a neighbour ?
     if info.Addr != r.Node.neighbourAddr {
-        r.Node.ForwardLeave(info)
+        r.Node.FwdLeave(info)
         return nil
     }
+    r.Node.LockMtx()
     r.Node.neighbourAddr = info.NewAddr
     r.Node.DialNeighbour()
+    r.Node.UnlockMtx()
+    return nil
+}
+
+func (r *NodeRpc) Repair(info NodeInfo, reply *bool) error {
+    log.Print("Recieved Repair from ")
+    log.Print(info.Addr)
+    log.Print("Neighbour: ", r.Node.neighbourAddr)
+
+    err := r.Node.FwdRepair(info)
+    if err != nil {
+        // failed FwdRepair -> we are the last node
+        r.Node.LockMtx()
+        r.Node.neighbourAddr = info.Addr
+        r.Node.DialNeighbour()
+        r.Node.UnlockMtx()
+        log.Print("Topology Repaired")
+    }
     return nil
 }
 
@@ -77,7 +102,6 @@ func Watch(r *NodeRpc) {
 // do i need this ?
 type Node interface {
     InitCluster()
-    Listen()
 }
 
 type node struct {
@@ -85,11 +109,11 @@ type node struct {
     uid int64
     addr string // socket addres
 
-    leaderUid int64 // leader == uid => I'm leader
-
     neighbourAddr string
     neighbourRpc *rpc.Client
+    neighbourMtx *sync.RWMutex
 
+    leaderUid int64 // leader == uid => I'm leader
     participatingInElection bool
 
     heartbeatTs time.Time
@@ -118,12 +142,29 @@ func NewNode(ip net.IP, port int) node {
     n := node {
         uid: getUid(ip, port),
         addr: getIpPort(ip, port),
+        neighbourMtx: new(sync.RWMutex),
     }
     return n
 }
 
 func (n node) getNodeInfo() NodeInfo {
     return NodeInfo {n.uid, n.addr}
+}
+
+func (n *node) LockMtx() {
+    n.neighbourMtx.Lock()
+}
+
+func (n *node) UnlockMtx() {
+    n.neighbourMtx.Unlock()
+}
+
+func (n *node) RLockMtx() {
+    n.neighbourMtx.RLock()
+}
+
+func (n *node) RUnlockMtx() {
+    n.neighbourMtx.RUnlock()
 }
 
 func (n node) Print() {
@@ -137,8 +178,12 @@ func (n node) PrintState() {
 }
 
 func (n *node) InitCluster() {
+    n.LockMtx()
     n.leaderUid = n.uid // set yourself as leader
     n.neighbourAddr = n.addr // set yourself as neighbour
+    n.Listen()
+    n.DialNeighbour()
+    n.UnlockMtx()
 }
 
 func (n *node) DialNeighbour() {
@@ -164,37 +209,112 @@ func (n *node) Join(addr string) {
     }
     log.Print("join atempt")
 
+    if reply.Addr == n.addr {
+        // do not accept self as neighbour
+        log.Print("joined broken ring - expecting repair")
+        return
+    }
+
+
+    n.LockMtx()
     n.neighbourAddr = reply.Addr
     n.DialNeighbour()
+    n.UnlockMtx()
 
     log.Print("joined")
 }
 
 func (n node) Leave() {
     // Synchronous call
+    n.RLockMtx()
     info := TwoNodeInfo {n.getNodeInfo(), 0, n.neighbourAddr}
     var reply bool
     log.Print("Leave ...")
+
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        //return errors.New("No neighbour: neighbourRpc == nil")
+        n.RUnlockMtx()
+        return
+    }
+
     err := n.neighbourRpc.Call("NodeRpc.Leave", info, &reply)
+    n.RUnlockMtx()
+
     if err != nil {
+        log.Print("call error:", err)
+        time.Sleep(10 * time.Millisecond)
+
         log.Fatal("call error:", err)
     }
 
+    n.LockMtx()
     n.neighbourAddr = ""
     n.neighbourRpc = nil
+    n.UnlockMtx()
 
     log.Print("Left")
 }
 
-func (n node) ForwardLeave(info TwoNodeInfo) {
+func (n node) Repair() {
     // Synchronous call
     var reply bool
-    log.Print("ForwardLeave ...")
-    err := n.neighbourRpc.Call("NodeRpc.Leave", info, &reply)
+    log.Print("Repair ...")
+
+    n.RLockMtx()
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        //return errors.New("No neighbour: neighbourRpc == nil")
+        n.RUnlockMtx()
+        return
+    }
+    err := n.neighbourRpc.Call("NodeRpc.Repair", n.getNodeInfo(), &reply)
+    n.RUnlockMtx()
     if err != nil {
         log.Fatal("call error:", err)
     }
-    log.Print("ForwardLeave done")
+    log.Print("Repair done")
+}
+
+func (n node) FwdLeave(info TwoNodeInfo) {
+    // Synchronous call
+    var reply bool
+    log.Print("FwdLeave ...")
+
+    n.RLockMtx()
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        //return errors.New("No neighbour: neighbourRpc == nil")
+        n.RUnlockMtx()
+        return
+    }
+    err := n.neighbourRpc.Call("NodeRpc.Leave", info, &reply)
+    n.RUnlockMtx()
+    if err != nil {
+        log.Fatal("call error:", err)
+    }
+    log.Print("FwdLeave done")
+}
+
+func (n node) FwdRepair(info NodeInfo) error {
+    // Synchronous call
+    var reply bool
+    log.Print("FwdRepair ...")
+
+    n.RLockMtx()
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        n.RUnlockMtx()
+        return errors.New("No neighbour: neighbourRpc == nil")
+    }
+    err := n.neighbourRpc.Call("NodeRpc.Repair", info, &reply)
+    n.RUnlockMtx()
+    if err != nil {
+        log.Print("call error:", err)
+        return err
+    }
+    log.Print("FwdRepair done")
+    return nil
 }
 
 func (n *node) Run() {
@@ -225,14 +345,37 @@ func (n *node) RunLeave() {
     }
 }
 
-func (n node) SendHeartbeat() {
-    // Synchronous call
-    var reply bool
-    err := n.neighbourRpc.Call("NodeRpc.Heartbeat", true, &reply)
-    if err != nil {
-        log.Fatal("call error:", err)
+func (n node) _sendHeartbeat() error {
+    reply := false
+
+    n.RLockMtx()
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        n.RUnlockMtx()
+        return errors.New("No neighbour: neighbourRpc == nil")
     }
-    log.Print("hb sent")
+
+    err := n.neighbourRpc.Call("NodeRpc.Heartbeat", true, &reply)
+    n.RUnlockMtx()
+    if err != nil {
+        return err
+    }
+    return nil
+}
+
+func (n node) SendHeartbeat() {
+    var err error
+    for i := 0; i < retryCount; i++ {
+        err = n._sendHeartbeat()
+        if err == nil {
+            break
+        }
+        log.Print("_sendHb error: ", err)
+        time.Sleep(retryDelay)
+    }
+    if err != nil {
+        log.Print("SendHb error: ", err)
+    }
 }
 
 func (n *node) HeartbeatChecker() {
@@ -240,11 +383,6 @@ func (n *node) HeartbeatChecker() {
     for {
         time.Sleep(heartbeatTimeout)
         ts := n.heartbeatTs
-        fmt.Println("checking hb expiration at")
-        fmt.Println(time.Now())
-        fmt.Println("> last hb at")
-        fmt.Println(ts)
-        fmt.Println("> hb expires at")
         heartbeatExpiration := ts.Add(heartbeatTimeout)
         fmt.Println(heartbeatExpiration)
         if time.Now().After(heartbeatExpiration) {
@@ -269,7 +407,8 @@ func (n *node) Listen() {
 }
 
 func (n node) RepairTopology() {
-    fmt.Println("RepairTopology")
+    fmt.Println("no hb -> RepairTopology ...")
+    n.Repair()
 }
 
 func (n node) SendMsg(msg string) bool {

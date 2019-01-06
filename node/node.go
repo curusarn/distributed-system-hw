@@ -28,6 +28,11 @@ type TwoNodeInfo struct {
     NewAddr string
 }
 
+type VariableMsg struct {
+    NodeInfo
+    SharedVariable int
+}
+
 // NodeRpc
 
 type NodeRpc struct {
@@ -131,9 +136,52 @@ func (r *NodeRpc) Read(info NodeInfo, variable *int) error {
         log.Print("Leader recv Read")
         // i'm the leader
         *variable = r.Node.sharedVariable
+        msg := VariableMsg {r.Node.getNodeInfo(), r.Node.sharedVariable}
+        r.Node.Broadcast(msg)
         return nil
     }
     *variable = r.Node.Read(info)
+    return nil
+}
+
+func (r *NodeRpc) Write(msg VariableMsg, reply *bool) error {
+    log.Print("Recieved Write ", msg)
+    if msg.Uid == r.Node.uid {
+        log.Print("No leader - starting election")
+        // full roundtrip
+        // start election by voting for self
+        r.Node.Vote(r.Node.uid)
+        return errors.New("No leader - starting election")
+    }
+    if r.Node.leaderUid == r.Node.uid {
+        log.Print("Leader recv Write")
+        // i'm the leader
+        r.Node.sharedVariable = msg.SharedVariable
+        msg := VariableMsg {r.Node.getNodeInfo(), r.Node.sharedVariable}
+        r.Node.Broadcast(msg)
+        return nil
+    }
+    r.Node.Write(msg)
+    return nil
+}
+
+func (r *NodeRpc) Broadcast(msg VariableMsg, reply *bool) error {
+    log.Print("Recieved Broadcast ", msg)
+    if r.Node.leaderUid == r.Node.uid {
+        log.Print("Leader recv Broadcast")
+        // i'm the leader
+        // end Broadcast
+        return nil
+    }
+    if msg.Uid == r.Node.uid {
+        log.Print("Broadcast ended at original node")
+        // full roundtrip
+        // end broadcast 
+        return nil
+    }
+    // set sharedVariable
+    r.Node.sharedVariable = msg.SharedVariable
+    r.Node.Broadcast(msg)
     return nil
 }
 
@@ -418,7 +466,7 @@ func (n node) ElectedMsg(uid int64) error {
     return nil
 }
 
-func (n node) Read(info NodeInfo) int {
+func (n *node) Read(info NodeInfo) int {
     // Synchronous call
     var sharedVariable int
     log.Print("Read ... ", info)
@@ -444,6 +492,50 @@ func (n node) Read(info NodeInfo) int {
     return sharedVariable
 }
 
+func (n node) Write(msg VariableMsg) error {
+    // Synchronous call
+    var reply bool
+    log.Print("Write ... ", msg)
+
+    n.RLockMtx()
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        n.RUnlockMtx()
+        log.Fatal("No neighbourRpc")
+        return errors.New("No neighbour: neighbourRpc == nil")
+    }
+    err := n.neighbourRpc.Call("NodeRpc.Write", msg, &reply)
+    n.RUnlockMtx()
+    if err != nil {
+        log.Print("call error:", err)
+        return err
+    }
+    log.Print("Write done")
+    return nil
+}
+func (n node) Broadcast(msg VariableMsg) error {
+    // Synchronous call
+    log.Print("Broadcast ... ", msg)
+
+    n.RLockMtx()
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        n.RUnlockMtx()
+        log.Fatal("No neighbourRpc")
+        return errors.New("No neighbour: neighbourRpc == nil")
+    }
+    var reply bool
+    err := n.neighbourRpc.Call("NodeRpc.Broadcast", msg, &reply)
+    n.RUnlockMtx()
+    if err != nil {
+        log.Print("call error:", err)
+
+        return err
+    }
+    log.Print("Broadcast done")
+    return nil
+}
+
 func (n *node) Run() {
     for {
         for i := 0; i < 3; i++ {
@@ -458,7 +550,7 @@ func (n *node) Run() {
 
 func (n *node) RunLeave() {
     for {
-        for i := 0; i < 10; i++ {
+        for j := 0; j < 10; j++ {
             for i := 0; i < 2; i++ {
                 log.Print("ready.")
                 n.SendHeartbeat()
@@ -467,6 +559,11 @@ func (n *node) RunLeave() {
             n.PrintState()
             time.Sleep(5000 * time.Millisecond)
             log.Print("Read: ", n.Read(n.getNodeInfo()))
+            if j == 3 {
+                log.Print("Write: 111")
+                msg := VariableMsg {n.getNodeInfo(), 111}
+                n.Write(msg)
+            }
         }
         n.Leave()
         return

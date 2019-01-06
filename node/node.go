@@ -13,7 +13,7 @@ import (
     "sync"
 )
 
-const heartbeatTimeout time.Duration = 5 * time.Second
+const heartbeatTimeout time.Duration = 10 * time.Second
 const retryDelay time.Duration = 100 * time.Millisecond
 const retryCount int = 3
 
@@ -44,11 +44,13 @@ func (r *NodeRpc) Join(info NodeInfo, reply *NodeInfo) error {
     log.Print("Recieved Join from ")
     log.Print(info.Addr)
     // what if I do not have a neighbour ?
-    reply.Uid = 0
+    reply.Uid = r.Node.leaderUid // pass leader uid to joining node
     r.Node.LockMtx()
     reply.Addr = r.Node.neighbourAddr
     r.Node.neighbourAddr = info.Addr
     r.Node.DialNeighbour()
+    // if dial fails set reply.neighbourAddr to ""
+    // or return error
     r.Node.UnlockMtx()
     return nil
 }
@@ -64,6 +66,8 @@ func (r *NodeRpc) Leave(info TwoNodeInfo, reply *bool) error {
     r.Node.LockMtx()
     r.Node.neighbourAddr = info.NewAddr
     r.Node.DialNeighbour()
+    // if dial fails set reply.neighbourAddr to ""
+    // or return error
     r.Node.UnlockMtx()
     return nil
 }
@@ -79,16 +83,59 @@ func (r *NodeRpc) Repair(info NodeInfo, reply *bool) error {
         r.Node.LockMtx()
         r.Node.neighbourAddr = info.Addr
         r.Node.DialNeighbour()
+        // if dial fails set reply to false 
+        // or return error
         r.Node.UnlockMtx()
         log.Print("Topology Repaired")
     }
     return nil
 }
 
-func (r *NodeRpc) NonRpcFunc(arg bool) error {
+func (r *NodeRpc) Vote(uid int64, reply *bool) error {
+    if uid > r.Node.uid {
+        r.Node.Vote(uid)
+        return nil
+    } else if uid < r.Node.uid {
+        if r.Node.participatingInElection == false {
+            r.Node.Vote(r.Node.uid)
+        }
+        return nil
+    }
+    // elected
+    r.Node.leaderUid = r.Node.uid
+    r.Node.participatingInElection = false
+    // post election
+    r.Node.ElectedMsg(r.Node.uid)
     return nil
 }
 
+func (r *NodeRpc) ElectedMsg(uid int64, reply *bool) error {
+    if uid != r.Node.uid {
+        r.Node.ElectedMsg(uid)
+        r.Node.leaderUid = uid
+        r.Node.participatingInElection = false
+    }
+    return nil
+}
+
+func (r *NodeRpc) Read(info NodeInfo, variable *int) error {
+    log.Print("Recieved Read ", info)
+    if info.Uid == r.Node.uid {
+        log.Print("No leader - starting election")
+        // full roundtrip
+        // start election by voting for self
+        r.Node.Vote(r.Node.uid)
+        return errors.New("No leader - starting election")
+    }
+    if r.Node.leaderUid == r.Node.uid {
+        log.Print("Leader recv Read")
+        // i'm the leader
+        *variable = r.Node.sharedVariable
+        return nil
+    }
+    *variable = r.Node.Read(info)
+    return nil
+}
 
 func Watch(r *NodeRpc) {
     for {
@@ -118,6 +165,7 @@ type node struct {
 
     heartbeatTs time.Time
 
+    sharedVariable int
     // topologyBroken bool ??
 }
 
@@ -175,18 +223,25 @@ func (n node) Print() {
 func (n node) PrintState() {
     log.Print("neigh: " + n.neighbourAddr)
     log.Print("leader: " + strconv.Itoa(int(n.leaderUid)))
+    log.Print("shrVar: " + strconv.Itoa(n.sharedVariable))
 }
 
 func (n *node) InitCluster() {
     n.LockMtx()
     n.leaderUid = n.uid // set yourself as leader
     n.neighbourAddr = n.addr // set yourself as neighbour
+
+    n.sharedVariable = 420
+
     n.Listen()
     n.DialNeighbour()
+    // Abort if dial fails  
+    // or return error
     n.UnlockMtx()
 }
 
 func (n *node) DialNeighbour() {
+    // TODO handle failed dials better
     client, err := rpc.DialHTTP("tcp", n.neighbourAddr)
     if err != nil {
         log.Fatal("dialing:", err)
@@ -199,6 +254,8 @@ func (n *node) Join(addr string) {
     client, err := rpc.DialHTTP("tcp", addr)
     if err != nil {
         log.Fatal("dialing:", err)
+        // retry?
+        // then Fatal
     }
 
     var reply NodeInfo
@@ -215,11 +272,12 @@ func (n *node) Join(addr string) {
         return
     }
 
-
     n.LockMtx()
     n.neighbourAddr = reply.Addr
     n.DialNeighbour()
     n.UnlockMtx()
+
+    n.leaderUid = reply.Uid
 
     log.Print("joined")
 }
@@ -317,28 +375,98 @@ func (n node) FwdRepair(info NodeInfo) error {
     return nil
 }
 
+func (n node) Vote(uid int64) error {
+    // Synchronous call
+    var reply bool
+    log.Print("Vote ... for ", uid)
+
+    n.RLockMtx()
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        n.RUnlockMtx()
+        return errors.New("No neighbour: neighbourRpc == nil")
+    }
+    err := n.neighbourRpc.Call("NodeRpc.Vote", uid, &reply)
+    n.RUnlockMtx()
+    if err != nil {
+        log.Print("call error:", err)
+        return err
+    }
+    n.participatingInElection = true
+    log.Print("Vote done")
+    return nil
+}
+
+func (n node) ElectedMsg(uid int64) error {
+    // Synchronous call
+    var reply bool
+    log.Print("ElectedMsg ... ", uid)
+
+    n.RLockMtx()
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        n.RUnlockMtx()
+        return errors.New("No neighbour: neighbourRpc == nil")
+    }
+    err := n.neighbourRpc.Call("NodeRpc.ElectedMsg", uid, &reply)
+    n.RUnlockMtx()
+    if err != nil {
+        log.Print("call error:", err)
+        return err
+    }
+    log.Print("ElectedMsg done")
+    return nil
+}
+
+func (n node) Read(info NodeInfo) int {
+    // Synchronous call
+    var sharedVariable int
+    log.Print("Read ... ", info)
+
+    n.RLockMtx()
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        n.RUnlockMtx()
+        // TODO return error and sharedVariable
+        log.Fatal("No neighbourRpc")
+        //return errors.New("No neighbour: neighbourRpc == nil")
+    }
+    err := n.neighbourRpc.Call("NodeRpc.Read", info, &sharedVariable)
+    n.RUnlockMtx()
+    if err != nil {
+        log.Print("call error:", err)
+
+        // TODO return error and sharedVariable
+        //return err
+    }
+    n.sharedVariable = sharedVariable
+    log.Print("Read done")
+    return sharedVariable
+}
+
 func (n *node) Run() {
     for {
         for i := 0; i < 3; i++ {
             log.Print("ready.")
             n.SendHeartbeat()
-            time.Sleep(2000 * time.Millisecond)
+            time.Sleep(5000 * time.Millisecond)
         }
         n.PrintState()
-        time.Sleep(2000 * time.Millisecond)
+        time.Sleep(5000 * time.Millisecond)
     }
 }
 
 func (n *node) RunLeave() {
     for {
-        for i := 0; i < 5; i++ {
-            for i := 0; i < 3; i++ {
+        for i := 0; i < 10; i++ {
+            for i := 0; i < 2; i++ {
                 log.Print("ready.")
                 n.SendHeartbeat()
-                time.Sleep(2000 * time.Millisecond)
+                time.Sleep(5000 * time.Millisecond)
             }
             n.PrintState()
-            time.Sleep(2000 * time.Millisecond)
+            time.Sleep(5000 * time.Millisecond)
+            log.Print("Read: ", n.Read(n.getNodeInfo()))
         }
         n.Leave()
         return

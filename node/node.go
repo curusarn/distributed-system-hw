@@ -16,6 +16,7 @@ import (
 const heartbeatTimeout time.Duration = 10 * time.Second
 const retryDelay time.Duration = 100 * time.Millisecond
 const retryCount int = 3
+const initTtl int = 10
 
 type NodeInfo struct {
     Uid int64
@@ -31,6 +32,22 @@ type TwoNodeInfo struct {
 type VariableMsg struct {
     NodeInfo
     SharedVariable int
+}
+
+type RpcMsg struct {
+    Ttl int // always
+    FromUid int64 // always
+    FromIpPort string // always
+    NewUid int64 // leave only
+    NewIpPort string // leave only
+    Value int // broadcast & write
+}
+
+type RpcReply struct {
+    Success bool // 
+    Uid int64
+    IpPort string
+    Value int
 }
 
 // NodeRpc
@@ -540,7 +557,7 @@ func (n *node) Run() {
     for {
         for i := 0; i < 3; i++ {
             log.Print("ready.")
-            n.SendHeartbeat()
+            n.Heartbeat()
             time.Sleep(5000 * time.Millisecond)
         }
         n.PrintState()
@@ -553,7 +570,7 @@ func (n *node) RunLeave() {
         for j := 0; j < 10; j++ {
             for i := 0; i < 2; i++ {
                 log.Print("ready.")
-                n.SendHeartbeat()
+                n.Heartbeat()
                 time.Sleep(5000 * time.Millisecond)
             }
             n.PrintState()
@@ -567,6 +584,51 @@ func (n *node) RunLeave() {
         }
         n.Leave()
         return
+    }
+}
+
+func (n node) _sendMsg(method string,
+                       args interface{},
+                       reply interface{}) error {
+    n.RLockMtx()
+    if n.neighbourRpc == nil {
+        log.Print("No neighbourRpc")
+        n.RUnlockMtx()
+        return errors.New("No neighbour: neighbourRpc == nil")
+    }
+    err := n.neighbourRpc.Call(method, args, reply)
+    n.RUnlockMtx()
+    return err
+}
+
+func (n node) SendMsg(method string,
+                      args interface{},
+                      reply interface{}) error {
+    var err error
+    serviceMethod := "NodeRpc." + method
+
+    for i := 0; i < retryCount; i++ {
+        err = n._sendMsg(serviceMethod, args, reply)
+        if err == nil {
+            break
+        }
+        // this will probably go away or become debug only
+        log.Print("_sendMsg error: ", err)
+        // multiple reply delays ?
+        time.Sleep(retryDelay)
+    }
+    if err != nil {
+        // this will probably go away or become debug only
+        log.Print("SendMsg error: ", err)
+    }
+    return err
+}
+
+func (n node) Heartbeat() {
+    var reply bool
+    err := n.SendMsg("Heartbeat", true, &reply)
+    if err != nil {
+        log.Print("Heartbeat error: ", err)
     }
 }
 
@@ -634,8 +696,4 @@ func (n *node) Listen() {
 func (n node) RepairTopology() {
     fmt.Println("no hb -> RepairTopology ...")
     n.Repair()
-}
-
-func (n node) SendMsg(msg string) bool {
-    return true
 }

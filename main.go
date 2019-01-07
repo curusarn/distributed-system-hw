@@ -17,7 +17,8 @@ var logFile string = "dsv.log"
 func main() {
     var initCluster bool
     flag.BoolVar(&initCluster, "init-cluster", false,
-                 "Node will initialize a cluster. (takes precedence over join option)")
+                 "Node will initialize a cluster." +
+                 " (takes precedence over join option)")
 
     var join string
     flag.StringVar(&join, "join", "",

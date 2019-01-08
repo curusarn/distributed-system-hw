@@ -57,6 +57,7 @@ func (c *LampartsClock) Inc() {
 type Msg interface {
     GetLogicalTime() int64
     SetLogicalTime(int64)
+    DecTtl() error
 }
 
 type LogicalTime struct {
@@ -76,9 +77,23 @@ type BaseMsg struct {
     Ttl int
 }
 
+func (m *BaseMsg) DecTtl() error {
+    m.Ttl--
+    if m.Ttl <= 0 {
+        return errors.New("Message ttl is equal to zero")
+    }
+    return nil
+}
+
 type ReplyMsg struct {
     LogicalTime
     Success bool
+}
+
+func (m ReplyMsg) DecTtl() error {
+    return nil
+    // possibly separate ReplyMsg from Msg interface
+    // and remove this func
 }
 
 func getBaseMsg() BaseMsg {
@@ -135,12 +150,18 @@ type NodeRpc struct {
 }
 
 func (r *NodeRpc) Heartbeat(msg BaseMsg, reply *ReplyMsg) error {
+    r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
+
     r.Node.heartbeatTs = time.Now()
     log.Print("Recieved Heartbeat")
+
+    reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
 
 func (r *NodeRpc) Join(msg AddrMsg, reply *NodeMsg) error {
+    r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
+
     log.Print("Recieved Join from ", msg.Addr)
     // what if I do not have a neighbour ?
     reply.Uid = r.Node.leaderUid // pass leader uid to joining node
@@ -152,14 +173,18 @@ func (r *NodeRpc) Join(msg AddrMsg, reply *NodeMsg) error {
     // if dial fails set reply.neighbourAddr to ""
     // or return error
     r.Node.UnlockMtx()
+    reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
 
 func (r *NodeRpc) Leave(msg TwoAddrMsg, reply *ReplyMsg) error {
+    r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
+
     log.Print("Recieved Leave from ", msg.Addr)
     // what if I do not have a neighbour ?
     if msg.Addr != r.Node.neighbourAddr {
         r.Node.FwdLeave(&msg, reply)
+        reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
     r.Node.LockMtx()
@@ -168,10 +193,13 @@ func (r *NodeRpc) Leave(msg TwoAddrMsg, reply *ReplyMsg) error {
     // if dial fails set reply.neighbourAddr to ""
     // or return error
     r.Node.UnlockMtx()
+    reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
 
 func (r *NodeRpc) Repair(msg AddrMsg, reply *ReplyMsg) error {
+    r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
+
     log.Print("Recieved Repair from ", msg.Addr)
     log.Print("Neighbour: ", r.Node.neighbourAddr)
 
@@ -186,18 +214,23 @@ func (r *NodeRpc) Repair(msg AddrMsg, reply *ReplyMsg) error {
         r.Node.UnlockMtx()
         log.Print("Topology Repaired")
     }
+    reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
 
 func (r *NodeRpc) Vote(msg UidMsg, reply *ReplyMsg) error {
+    r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
+
     if msg.Uid > r.Node.uid {
         r.Node.FwdVote(&msg, reply)
+        reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     } else if msg.Uid < r.Node.uid {
         if r.Node.participatingInElection == false {
             msg.Uid = r.Node.uid
             r.Node.FwdVote(&msg, reply)
         }
+        reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
     // elected
@@ -205,25 +238,33 @@ func (r *NodeRpc) Vote(msg UidMsg, reply *ReplyMsg) error {
     r.Node.participatingInElection = false
     // post election
     r.Node.StartElectedMsg()
+
+    reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
 
 func (r *NodeRpc) ElectedMsg(msg UidMsg, reply *ReplyMsg) error {
+    r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
+
     if msg.Uid != r.Node.uid {
         r.Node.FwdElectedMsg(&msg, reply)
         r.Node.leaderUid = msg.Uid
         r.Node.participatingInElection = false
     }
+    reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
 
 func (r *NodeRpc) Read(msg UidMsg, reply *VarMsg) error {
+    r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
+
     log.Print("Recieved Read ", msg)
     if msg.Uid == r.Node.uid {
         log.Print("No leader - starting election")
         // full roundtrip
         // start election by voting for self
-        r.Node.StartVote()
+        r.Node.StartVote() // this is blocking - we might just repeat the read
+        reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return errors.New("No leader - starting election")
     }
     if r.Node.leaderUid == r.Node.uid {
@@ -231,6 +272,7 @@ func (r *NodeRpc) Read(msg UidMsg, reply *VarMsg) error {
         // i'm the leader
         reply.SharedVariable = r.Node.sharedVariable
         r.Node.StartBroadcast()
+        reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
     err, value := r.Node.FwdRead(&msg, reply)
@@ -239,16 +281,20 @@ func (r *NodeRpc) Read(msg UidMsg, reply *VarMsg) error {
         log.Print("ReadRpc error 8899")
     }
     reply.SharedVariable = value
+    reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
 
 func (r *NodeRpc) Write(msg VarMsg, reply *ReplyMsg) error {
+    r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
+
     log.Print("Recieved Write ", msg)
     if msg.Uid == r.Node.uid {
         log.Print("No leader - starting election")
         // full roundtrip
         // start election by voting for self
-        r.Node.StartVote()
+        r.Node.StartVote() // this is blocking - we might just repeat the read
+        reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return errors.New("No leader - starting election")
     }
     if r.Node.leaderUid == r.Node.uid {
@@ -256,29 +302,36 @@ func (r *NodeRpc) Write(msg VarMsg, reply *ReplyMsg) error {
         // i'm the leader
         r.Node.sharedVariable = msg.SharedVariable
         r.Node.StartBroadcast()
+        reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
     r.Node.FwdWrite(&msg, reply)
+    reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
 
 func (r *NodeRpc) Broadcast(msg VarMsg, reply *ReplyMsg) error {
+    r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
+
     log.Print("Recieved Broadcast ", msg)
     if r.Node.leaderUid == r.Node.uid {
         log.Print("Leader recv Broadcast")
         // i'm the leader
         // end Broadcast
+        reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
     if msg.Uid == r.Node.uid {
         log.Print("Broadcast ended at original node")
         // full roundtrip
         // end broadcast 
+        reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
     // set sharedVariable
     r.Node.sharedVariable = msg.SharedVariable
     r.Node.FwdBroadcast(&msg, reply)
+    reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
 
@@ -381,6 +434,7 @@ func (n node) PrintState() {
     log.Print("neigh: " + n.neighbourAddr)
     log.Print("leader: " + strconv.Itoa(int(n.leaderUid)))
     log.Print("shrVar: " + strconv.Itoa(n.sharedVariable))
+    log.Print("logTime: " + strconv.Itoa(int(n.logicalClock.Get())))
 }
 
 func (n *node) InitCluster() {
@@ -407,16 +461,16 @@ func (n *node) DialNeighbour() {
 }
 
 
-func (n node) _sendMsg(method string, args Msg, reply Msg) error {
+func (n node) _sendMsg(method string, msg Msg, reply Msg) error {
     n.RLockMtx()
     if n.neighbourRpc == nil {
         log.Print("No neighbourRpc")
         n.RUnlockMtx()
         return errors.New("No neighbour: neighbourRpc == nil")
     }
-    args.SetLogicalTime(n.logicalClock.GetAndInc())
+    msg.SetLogicalTime(n.logicalClock.GetAndInc())
 
-    err := n.neighbourRpc.Call(method, args, reply)
+    err := n.neighbourRpc.Call(method, msg, reply)
     if err == nil {
         n.logicalClock.SetIfHigherAndInc(reply.GetLogicalTime())
     }
@@ -424,12 +478,18 @@ func (n node) _sendMsg(method string, args Msg, reply Msg) error {
     return err
 }
 
-func (n node) SendMsg(method string, args Msg, reply Msg) error {
+func (n node) SendMsg(method string, msg Msg, reply Msg) error {
     var err error
     serviceMethod := "NodeRpc." + method
+    err = msg.DecTtl()
+    if err != nil {
+        // this will probably go away or become debug only
+        log.Print("SendMsg error: ", err)
+        return err
+    }
 
     for i := 0; i < retryCount; i++ {
-        err = n._sendMsg(serviceMethod, args, reply)
+        err = n._sendMsg(serviceMethod, msg, reply)
         if err == nil {
             break
         }
@@ -474,6 +534,7 @@ func (n *node) Join(addr string) {
         log.Fatal("call error:", err)
     }
     n.logicalClock.SetIfHigherAndInc(reply.GetLogicalTime())
+    n.leaderUid = reply.Uid
 
     if reply.Addr == n.addr {
         // do not accept self as neighbour
@@ -485,8 +546,6 @@ func (n *node) Join(addr string) {
     n.neighbourAddr = reply.Addr
     n.DialNeighbour()
     n.UnlockMtx()
-
-    n.leaderUid = reply.Uid
 
     log.Print("Joined")
 }

@@ -18,21 +18,99 @@ const retryDelay time.Duration = 100 * time.Millisecond
 const retryCount int = 3
 const initTtl int = 10
 
-type NodeInfo struct {
+type LampartsClock struct {
+    Time int64
+    Lock sync.RWMutex
+}
+
+func (c *LampartsClock) Get() int64 {
+    c.Lock.RLock()
+    t := c.Time
+    c.Lock.RUnlock()
+    return t
+}
+
+func (c *LampartsClock) GetAndInc() int64 {
+    c.Lock.RLock()
+    c.Time++
+    t := c.Time
+    c.Lock.RUnlock()
+    return t
+}
+
+func (c *LampartsClock) SetIfHigherAndInc(t int64) {
+    c.Lock.Lock()
+    if c.Time < t {
+        c.Time = t
+    }
+    c.Time++
+    c.Lock.Unlock()
+}
+
+func (c *LampartsClock) Inc() {
+    c.Lock.Lock()
+    c.Time++
+    c.Lock.Unlock()
+}
+
+
+type Msg interface {
+    GetLogicalTime() int64
+    SetLogicalTime(int64)
+}
+
+type LogicalTime struct {
+    LogicalTime int64
+}
+
+func (l LogicalTime) GetLogicalTime() int64 {
+    return l.LogicalTime
+}
+
+func (l *LogicalTime) SetLogicalTime(t int64) {
+    l.LogicalTime = t
+}
+
+type BaseMsg struct {
+    LogicalTime
+    Ttl int
+}
+
+type ReplyMsg struct {
+    LogicalTime
+    Success bool
+}
+
+func getBaseMsg() BaseMsg {
+    return BaseMsg {Ttl: initTtl}
+}
+
+type UidMsg struct {
+    BaseMsg
+    Uid int64
+}
+
+type AddrMsg struct {
+    BaseMsg
+    Addr string
+}
+
+type NodeMsg struct {
+    BaseMsg
     Uid int64
     Addr string
 }
 
-type TwoNodeInfo struct {
-    NodeInfo
-    NewUid int64
+type TwoAddrMsg struct {
+    AddrMsg
     NewAddr string
 }
 
-type VariableMsg struct {
-    NodeInfo
+type VarMsg struct {
+    NodeMsg
     SharedVariable int
 }
+
 
 type RpcMsg struct {
     Ttl int // always
@@ -56,20 +134,20 @@ type NodeRpc struct {
     Node *node
 }
 
-func (r *NodeRpc) Heartbeat(_ bool, _ *bool) error {
+func (r *NodeRpc) Heartbeat(msg BaseMsg, reply *ReplyMsg) error {
     r.Node.heartbeatTs = time.Now()
     log.Print("Recieved Heartbeat")
     return nil
 }
 
-func (r *NodeRpc) Join(info NodeInfo, reply *NodeInfo) error {
-    log.Print("Recieved Join from ")
-    log.Print(info.Addr)
+func (r *NodeRpc) Join(msg AddrMsg, reply *NodeMsg) error {
+    log.Print("Recieved Join from ", msg.Addr)
     // what if I do not have a neighbour ?
     reply.Uid = r.Node.leaderUid // pass leader uid to joining node
+
     r.Node.LockMtx()
     reply.Addr = r.Node.neighbourAddr
-    r.Node.neighbourAddr = info.Addr
+    r.Node.neighbourAddr = msg.Addr
     r.Node.DialNeighbour()
     // if dial fails set reply.neighbourAddr to ""
     // or return error
@@ -77,16 +155,15 @@ func (r *NodeRpc) Join(info NodeInfo, reply *NodeInfo) error {
     return nil
 }
 
-func (r *NodeRpc) Leave(info TwoNodeInfo, reply *bool) error {
-    log.Print("Recieved Leave from ")
-    log.Print(info.Addr)
+func (r *NodeRpc) Leave(msg TwoAddrMsg, reply *ReplyMsg) error {
+    log.Print("Recieved Leave from ", msg.Addr)
     // what if I do not have a neighbour ?
-    if info.Addr != r.Node.neighbourAddr {
-        r.Node.FwdLeave(info)
+    if msg.Addr != r.Node.neighbourAddr {
+        r.Node.FwdLeave(&msg, reply)
         return nil
     }
     r.Node.LockMtx()
-    r.Node.neighbourAddr = info.NewAddr
+    r.Node.neighbourAddr = msg.NewAddr
     r.Node.DialNeighbour()
     // if dial fails set reply.neighbourAddr to ""
     // or return error
@@ -94,16 +171,15 @@ func (r *NodeRpc) Leave(info TwoNodeInfo, reply *bool) error {
     return nil
 }
 
-func (r *NodeRpc) Repair(info NodeInfo, reply *bool) error {
-    log.Print("Recieved Repair from ")
-    log.Print(info.Addr)
+func (r *NodeRpc) Repair(msg AddrMsg, reply *ReplyMsg) error {
+    log.Print("Recieved Repair from ", msg.Addr)
     log.Print("Neighbour: ", r.Node.neighbourAddr)
 
-    err := r.Node.FwdRepair(info)
+    err := r.Node.FwdRepair(&msg, reply)
     if err != nil {
         // failed FwdRepair -> we are the last node
         r.Node.LockMtx()
-        r.Node.neighbourAddr = info.Addr
+        r.Node.neighbourAddr = msg.Addr
         r.Node.DialNeighbour()
         // if dial fails set reply to false 
         // or return error
@@ -113,13 +189,14 @@ func (r *NodeRpc) Repair(info NodeInfo, reply *bool) error {
     return nil
 }
 
-func (r *NodeRpc) Vote(uid int64, reply *bool) error {
-    if uid > r.Node.uid {
-        r.Node.FwdVote(uid)
+func (r *NodeRpc) Vote(msg UidMsg, reply *ReplyMsg) error {
+    if msg.Uid > r.Node.uid {
+        r.Node.FwdVote(&msg, reply)
         return nil
-    } else if uid < r.Node.uid {
+    } else if msg.Uid < r.Node.uid {
         if r.Node.participatingInElection == false {
-            r.Node.FwdVote(r.Node.uid)
+            msg.Uid = r.Node.uid
+            r.Node.FwdVote(&msg, reply)
         }
         return nil
     }
@@ -131,18 +208,18 @@ func (r *NodeRpc) Vote(uid int64, reply *bool) error {
     return nil
 }
 
-func (r *NodeRpc) ElectedMsg(uid int64, reply *bool) error {
-    if uid != r.Node.uid {
-        r.Node.FwdElectedMsg(uid)
-        r.Node.leaderUid = uid
+func (r *NodeRpc) ElectedMsg(msg UidMsg, reply *ReplyMsg) error {
+    if msg.Uid != r.Node.uid {
+        r.Node.FwdElectedMsg(&msg, reply)
+        r.Node.leaderUid = msg.Uid
         r.Node.participatingInElection = false
     }
     return nil
 }
 
-func (r *NodeRpc) Read(info NodeInfo, reply *int) error {
-    log.Print("Recieved Read ", info)
-    if info.Uid == r.Node.uid {
+func (r *NodeRpc) Read(msg UidMsg, reply *VarMsg) error {
+    log.Print("Recieved Read ", msg)
+    if msg.Uid == r.Node.uid {
         log.Print("No leader - starting election")
         // full roundtrip
         // start election by voting for self
@@ -152,20 +229,20 @@ func (r *NodeRpc) Read(info NodeInfo, reply *int) error {
     if r.Node.leaderUid == r.Node.uid {
         log.Print("Leader recv Read")
         // i'm the leader
-        *reply = r.Node.sharedVariable
+        reply.SharedVariable = r.Node.sharedVariable
         r.Node.StartBroadcast()
         return nil
     }
-    err, value := r.Node.FwdRead(info)
+    err, value := r.Node.FwdRead(&msg, reply)
     if err != nil {
         // handle errors
         log.Print("ReadRpc error 8899")
     }
-    *reply = value
+    reply.SharedVariable = value
     return nil
 }
 
-func (r *NodeRpc) Write(msg VariableMsg, reply *bool) error {
+func (r *NodeRpc) Write(msg VarMsg, reply *ReplyMsg) error {
     log.Print("Recieved Write ", msg)
     if msg.Uid == r.Node.uid {
         log.Print("No leader - starting election")
@@ -181,11 +258,11 @@ func (r *NodeRpc) Write(msg VariableMsg, reply *bool) error {
         r.Node.StartBroadcast()
         return nil
     }
-    r.Node.FwdWrite(msg)
+    r.Node.FwdWrite(&msg, reply)
     return nil
 }
 
-func (r *NodeRpc) Broadcast(msg VariableMsg, reply *bool) error {
+func (r *NodeRpc) Broadcast(msg VarMsg, reply *ReplyMsg) error {
     log.Print("Recieved Broadcast ", msg)
     if r.Node.leaderUid == r.Node.uid {
         log.Print("Leader recv Broadcast")
@@ -201,7 +278,7 @@ func (r *NodeRpc) Broadcast(msg VariableMsg, reply *bool) error {
     }
     // set sharedVariable
     r.Node.sharedVariable = msg.SharedVariable
-    r.Node.FwdBroadcast(msg)
+    r.Node.FwdBroadcast(&msg, reply)
     return nil
 }
 
@@ -213,11 +290,6 @@ func Watch(r *NodeRpc) {
 }
 
 // Node
-
-// do i need this ?
-type Node interface {
-    InitCluster()
-}
 
 type node struct {
     // const
@@ -235,6 +307,8 @@ type node struct {
 
     sharedVariable int
     // topologyBroken bool ??
+
+    logicalClock *LampartsClock
 }
 
 func getUid(ip net.IP, port int) int64 {
@@ -259,13 +333,28 @@ func NewNode(ip net.IP, port int) node {
         uid: getUid(ip, port),
         addr: getIpPort(ip, port),
         neighbourMtx: new(sync.RWMutex),
+        logicalClock: new(LampartsClock),
     }
     return n
 }
 
-func (n node) getNodeInfo() NodeInfo {
-    return NodeInfo {n.uid, n.addr}
+func (n node) getBaseMsg() BaseMsg {
+    return BaseMsg {LogicalTime {0}, initTtl}
+    // LogicalTime is being set in SendMsg()
 }
+
+func (n node) getUidMsg() UidMsg {
+    return UidMsg {n.getBaseMsg(), n.uid}
+}
+
+func (n node) getAddrMsg() AddrMsg {
+    return AddrMsg {n.getBaseMsg(), n.addr}
+}
+
+func (n node) getNodeMsg() NodeMsg {
+    return NodeMsg {n.getBaseMsg(), n.uid, n.addr}
+}
+
 
 func (n *node) LockMtx() {
     n.neighbourMtx.Lock()
@@ -318,23 +407,24 @@ func (n *node) DialNeighbour() {
 }
 
 
-func (n node) _sendMsg(method string,
-                       args interface{},
-                       reply interface{}) error {
+func (n node) _sendMsg(method string, args Msg, reply Msg) error {
     n.RLockMtx()
     if n.neighbourRpc == nil {
         log.Print("No neighbourRpc")
         n.RUnlockMtx()
         return errors.New("No neighbour: neighbourRpc == nil")
     }
+    args.SetLogicalTime(n.logicalClock.GetAndInc())
+
     err := n.neighbourRpc.Call(method, args, reply)
+    if err == nil {
+        n.logicalClock.SetIfHigherAndInc(reply.GetLogicalTime())
+    }
     n.RUnlockMtx()
     return err
 }
 
-func (n node) SendMsg(method string,
-                      args interface{},
-                      reply interface{}) error {
+func (n node) SendMsg(method string, args Msg, reply Msg) error {
     var err error
     serviceMethod := "NodeRpc." + method
 
@@ -358,8 +448,9 @@ func (n node) SendMsg(method string,
 // Heartbeat
 
 func (n node) Heartbeat() {
-    var reply bool
-    err := n.SendMsg("Heartbeat", true, &reply)
+    msg := n.getBaseMsg()
+    var reply ReplyMsg
+    err := n.SendMsg("Heartbeat", &msg, &reply)
     if err != nil {
         log.Print("Heartbeat error: ", err)
     }
@@ -376,12 +467,13 @@ func (n *node) Join(addr string) {
         // then Fatal
     }
 
-    var reply NodeInfo
+    var reply NodeMsg
     log.Print("Joining")
-    err = client.Call("NodeRpc.Join", n.getNodeInfo(), &reply)
+    err = client.Call("NodeRpc.Join", n.getNodeMsg(), &reply)
     if err != nil {
         log.Fatal("call error:", err)
     }
+    n.logicalClock.SetIfHigherAndInc(reply.GetLogicalTime())
 
     if reply.Addr == n.addr {
         // do not accept self as neighbour
@@ -400,10 +492,10 @@ func (n *node) Join(addr string) {
 }
 
 func (n node) StartLeave() {
-    log.Print("Starting Leave")
-    var reply bool
-    msg := TwoNodeInfo {n.getNodeInfo(), 0, n.neighbourAddr}
-    err := n.SendMsg("Leave", msg, &reply)
+    var reply ReplyMsg
+    msg := TwoAddrMsg {n.getAddrMsg(), n.neighbourAddr}
+    log.Print("Starting Leave ", msg)
+    err := n.SendMsg("Leave", &msg, &reply)
     if err != nil {
         log.Print("Leave error:", err)
     }
@@ -416,17 +508,16 @@ func (n node) StartLeave() {
     log.Print("Left")
 }
 
-func (n node) FwdLeave(msg TwoNodeInfo) error {
+func (n node) FwdLeave(msg *TwoAddrMsg, reply *ReplyMsg) error {
     log.Print("Forwarding Leave")
-    var reply bool
-    return n.SendMsg("Leave", msg, &reply)
+    return n.SendMsg("Leave", msg, reply)
 }
 
 func (n node) StartRepair() error {
-    log.Print("Starting Repair")
-    var reply bool
-    msg := n.getNodeInfo()
-    err := n.SendMsg("Repair", msg, &reply)
+    var reply ReplyMsg
+    msg := n.getAddrMsg()
+    log.Print("Starting Repair ", msg)
+    err := n.SendMsg("Repair", &msg, &reply)
     if err != nil {
         log.Print("Repair error:", err)
         return err
@@ -434,18 +525,18 @@ func (n node) StartRepair() error {
     return err
 }
 
-func (n node) FwdRepair(msg NodeInfo) error {
+func (n node) FwdRepair(msg *AddrMsg, reply *ReplyMsg) error {
     log.Print("Forwarding Repair")
-    var reply bool
-    return n.SendMsg("Repair", msg, &reply)
+    return n.SendMsg("Repair", msg, reply)
 }
 
 // Vote ElectedMsg
 
 func (n node) StartVote() error {
-    var reply bool
-    log.Print("Starting Vote ", n.uid)
-    err := n.SendMsg("Vote", n.uid, &reply)
+    var reply ReplyMsg
+    msg := n.getUidMsg()
+    log.Print("Starting Vote ", msg)
+    err := n.SendMsg("Vote", &msg, &reply)
     if err != nil {
         log.Print("Vote error:", err)
         return err
@@ -454,10 +545,9 @@ func (n node) StartVote() error {
     return err
 }
 
-func (n node) FwdVote(uid int64) error {
-    var reply bool
-    log.Print("Forwarding Vote ", uid)
-    err := n.SendMsg("Vote", n.uid, &reply)
+func (n node) FwdVote(msg *UidMsg, reply *ReplyMsg) error {
+    log.Print("Forwarding Vote ", msg)
+    err := n.SendMsg("Vote", msg, reply)
     if err == nil {
         n.participatingInElection = true
     }
@@ -465,10 +555,11 @@ func (n node) FwdVote(uid int64) error {
 }
 
 func (n node) StartElectedMsg() error {
-    var reply bool
-    log.Print("Starting ElectedMsg ", n.uid)
+    var reply ReplyMsg
+    msg := UidMsg {n.getBaseMsg(), n.uid}
+    log.Print("Starting ElectedMsg ", msg)
 
-    err := n.SendMsg("ElectedMsg", n.uid, &reply)
+    err := n.SendMsg("ElectedMsg", &msg, &reply)
     if err != nil {
         log.Print("ElectedMsg error:", err)
         return err
@@ -477,11 +568,10 @@ func (n node) StartElectedMsg() error {
     return err
 }
 
-func (n node) FwdElectedMsg(uid int64) error {
-    var reply bool
-    log.Print("Forwarding ElectedMsg ", uid)
+func (n node) FwdElectedMsg(msg *UidMsg, reply *ReplyMsg) error {
+    log.Print("Forwarding ElectedMsg ", msg)
 
-    err := n.SendMsg("ElectedMsg", uid, &reply)
+    err := n.SendMsg("ElectedMsg", msg, reply)
     if err == nil {
         n.participatingInElection = true
     }
@@ -492,31 +582,30 @@ func (n node) FwdElectedMsg(uid int64) error {
 // Read Write Broadcast
 
 func (n *node) StartRead() (error, int) {
-    log.Print("Starting Read")
-    var reply int
-    msg := n.getNodeInfo()
-    err := n.SendMsg("Read", msg, &reply)
+    var reply VarMsg
+    msg := n.getUidMsg()
+    log.Print("Starting Read ", msg)
+    err := n.SendMsg("Read", &msg, &reply)
     if err != nil {
         log.Print("Read error: ", err)
     }
-    return err, reply
+    return err, reply.SharedVariable
 }
 
-func (n *node) FwdRead(msg NodeInfo) (error, int) {
+func (n *node) FwdRead(msg *UidMsg, reply *VarMsg) (error, int) {
     log.Print("Forwarding read ", msg)
-    var reply int
-    err := n.SendMsg("Read", msg, &reply)
+    err := n.SendMsg("Read", msg, reply)
     if err == nil {
-        n.sharedVariable = reply
+        n.sharedVariable = reply.SharedVariable
     }
-    return err, reply
+    return err, reply.SharedVariable
 }
 
 func (n node) StartWrite(value int) error {
-    log.Print("Starting Write ", value)
-    var reply bool
-    msg := VariableMsg {n.getNodeInfo(), value}
-    err := n.SendMsg("Write", msg, &reply)
+    var reply ReplyMsg
+    msg := VarMsg {n.getNodeMsg(), value}
+    log.Print("Starting Write ", msg)
+    err := n.SendMsg("Write", &msg, &reply)
     if err != nil {
         log.Print("Write error: ", err)
         return err
@@ -525,26 +614,24 @@ func (n node) StartWrite(value int) error {
     return err
 }
 
-func (n node) FwdWrite(msg VariableMsg) error {
+func (n node) FwdWrite(msg *VarMsg, reply *ReplyMsg) error {
     log.Print("Forwarding Write ", msg)
-    var reply bool
-    return n.SendMsg("Write", msg, &reply)
+    return n.SendMsg("Write", msg, reply)
 }
 
 func (n node) StartBroadcast() {
-    log.Print("Starting Broadcast ", n.sharedVariable)
-    var reply bool
-    msg := VariableMsg {n.getNodeInfo(), n.sharedVariable}
-    err := n.SendMsg("Broadcast", msg, &reply)
+    var reply ReplyMsg
+    msg := VarMsg {n.getNodeMsg(), n.sharedVariable}
+    log.Print("Starting Broadcast ", msg)
+    err := n.SendMsg("Broadcast", &msg, &reply)
     if err != nil {
         log.Print("Broadcast error: ", err)
     }
 }
 
-func (n node) FwdBroadcast(msg VariableMsg) error {
+func (n node) FwdBroadcast(msg *VarMsg, reply *ReplyMsg) error {
     log.Print("Forwarding Broadcast ", msg)
-    var reply bool
-    return n.SendMsg("Broadcast", msg, &reply)
+    return n.SendMsg("Broadcast", msg, reply)
 }
 
 // more functions

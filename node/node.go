@@ -25,32 +25,32 @@ type LampartsClock struct {
 
 func (c *LampartsClock) Get() int64 {
     c.Lock.RLock()
+    defer c.Lock.RUnlock()
     t := c.Time
-    c.Lock.RUnlock()
     return t
 }
 
 func (c *LampartsClock) GetAndInc() int64 {
     c.Lock.RLock()
+    defer c.Lock.RUnlock()
     c.Time++
     t := c.Time
-    c.Lock.RUnlock()
     return t
 }
 
 func (c *LampartsClock) SetIfHigherAndInc(t int64) {
     c.Lock.Lock()
+    defer c.Lock.Unlock()
     if c.Time < t {
         c.Time = t
     }
     c.Time++
-    c.Lock.Unlock()
 }
 
 func (c *LampartsClock) Inc() {
     c.Lock.Lock()
+    defer c.Lock.Unlock()
     c.Time++
-    c.Lock.Unlock()
 }
 
 
@@ -166,13 +166,16 @@ func (r *NodeRpc) Join(msg AddrMsg, reply *NodeMsg) error {
     // what if I do not have a neighbour ?
     reply.Uid = r.Node.leaderUid // pass leader uid to joining node
 
-    r.Node.LockMtx()
-    reply.Addr = r.Node.neighbourAddr
-    r.Node.neighbourAddr = msg.Addr
-    r.Node.DialNeighbour()
+    func() {
+        r.Node.LockMtx()
+        defer r.Node.UnlockMtx()
+        reply.Addr = r.Node.neighbourAddr
+        r.Node.neighbourAddr = msg.Addr
+        r.Node.DialNeighbour()
+    }()
+
     // if dial fails set reply.neighbourAddr to ""
     // or return error
-    r.Node.UnlockMtx()
     reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
@@ -187,12 +190,16 @@ func (r *NodeRpc) Leave(msg TwoAddrMsg, reply *ReplyMsg) error {
         reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
-    r.Node.LockMtx()
-    r.Node.neighbourAddr = msg.NewAddr
-    r.Node.DialNeighbour()
-    // if dial fails set reply.neighbourAddr to ""
-    // or return error
-    r.Node.UnlockMtx()
+
+    func() {
+        r.Node.LockMtx()
+        defer r.Node.UnlockMtx()
+        r.Node.neighbourAddr = msg.NewAddr
+        r.Node.DialNeighbour()
+        // if dial fails set reply.neighbourAddr to ""
+        // or return error
+    }()
+
     reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
 }
@@ -205,13 +212,16 @@ func (r *NodeRpc) Repair(msg AddrMsg, reply *ReplyMsg) error {
 
     err := r.Node.FwdRepair(&msg, reply)
     if err != nil {
-        // failed FwdRepair -> we are the last node
-        r.Node.LockMtx()
-        r.Node.neighbourAddr = msg.Addr
-        r.Node.DialNeighbour()
-        // if dial fails set reply to false 
-        // or return error
-        r.Node.UnlockMtx()
+        func() {
+            // failed FwdRepair -> we are the last node
+            r.Node.LockMtx()
+            defer r.Node.UnlockMtx()
+            r.Node.neighbourAddr = msg.Addr
+            r.Node.DialNeighbour()
+            // if dial fails set reply to false 
+            // or return error
+        }()
+
         log.Print("Topology Repaired")
     }
     reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
@@ -439,6 +449,7 @@ func (n node) PrintState() {
 
 func (n *node) InitCluster() {
     n.LockMtx()
+    defer n.UnlockMtx()
     n.leaderUid = n.uid // set yourself as leader
     n.neighbourAddr = n.addr // set yourself as neighbour
 
@@ -448,7 +459,6 @@ func (n *node) InitCluster() {
     n.DialNeighbour()
     // Abort if dial fails  
     // or return error
-    n.UnlockMtx()
 }
 
 func (n *node) DialNeighbour() {
@@ -463,9 +473,9 @@ func (n *node) DialNeighbour() {
 
 func (n node) _sendMsg(method string, msg Msg, reply Msg) error {
     n.RLockMtx()
+    defer n.RUnlockMtx()
     if n.neighbourRpc == nil {
-        log.Print("No neighbourRpc")
-        n.RUnlockMtx()
+        // log.Print("No neighbourRpc")
         return errors.New("No neighbour: neighbourRpc == nil")
     }
     msg.SetLogicalTime(n.logicalClock.GetAndInc())
@@ -474,7 +484,6 @@ func (n node) _sendMsg(method string, msg Msg, reply Msg) error {
     if err == nil {
         n.logicalClock.SetIfHigherAndInc(reply.GetLogicalTime())
     }
-    n.RUnlockMtx()
     return err
 }
 
@@ -518,20 +527,27 @@ func (n node) Heartbeat() {
 
 // Join Leave Repair
 
-func (n *node) Join(addr string) {
-    // dial before call ... duh
+func (n *node) _join(addr string, reply *NodeMsg) error {
     client, err := rpc.DialHTTP("tcp", addr)
     if err != nil {
-        log.Fatal("dialing:", err)
-        // retry?
-        // then Fatal
+        return err
     }
+    log.Print("Dialing succes - joining")
+    return client.Call("NodeRpc.Join", n.getNodeMsg(), reply)
+}
 
+func (n *node) Join(addr string) {
     var reply NodeMsg
-    log.Print("Joining")
-    err = client.Call("NodeRpc.Join", n.getNodeMsg(), &reply)
-    if err != nil {
-        log.Fatal("call error:", err)
+    for i := 0; i < retryCount; i++ {
+        err := n._join(addr, &reply)
+        if err == nil {
+            break
+        }
+        // this will probably go away or become debug only
+        log.Print("_join error: ", err)
+        // multiple reply delays ?
+        time.Sleep(retryDelay)
+
     }
     n.logicalClock.SetIfHigherAndInc(reply.GetLogicalTime())
     n.leaderUid = reply.Uid
@@ -543,9 +559,9 @@ func (n *node) Join(addr string) {
     }
 
     n.LockMtx()
+    defer n.UnlockMtx()
     n.neighbourAddr = reply.Addr
     n.DialNeighbour()
-    n.UnlockMtx()
 
     log.Print("Joined")
 }
@@ -560,9 +576,9 @@ func (n node) StartLeave() {
     }
 
     n.LockMtx()
+    defer n.UnlockMtx()
     n.neighbourAddr = ""
     n.neighbourRpc = nil
-    n.UnlockMtx()
 
     log.Print("Left")
 }
@@ -641,6 +657,9 @@ func (n node) FwdElectedMsg(msg *UidMsg, reply *ReplyMsg) error {
 // Read Write Broadcast
 
 func (n *node) StartRead() (error, int) {
+    if n.leaderUid == n.uid {
+        return nil, n.sharedVariable
+    }
     var reply VarMsg
     msg := n.getUidMsg()
     log.Print("Starting Read ", msg)
@@ -669,7 +688,6 @@ func (n node) StartWrite(value int) error {
         log.Print("Write error: ", err)
         return err
     }
-    log.Print("Write successful: ")
     return err
 }
 
@@ -721,6 +739,8 @@ func (n *node) Listen() {
     }
     go http.Serve(l, nil)
 }
+
+
 
 func (n *node) Run() {
     for {

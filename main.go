@@ -1,6 +1,7 @@
 package main
 
 import (
+    "bufio"
     "fmt"
     "time"
     "net"
@@ -46,11 +47,12 @@ func main() {
         // fatal
     }
     mw := io.MultiWriter(os.Stdout, f)
-    log.SetOutput(mw)
-    log.Print("-- log init --")
-    log.Print(time.Now())
+    logger := log.New(mw, "", log.Ldate|log.Ltime)
+    logger.SetOutput(mw)
+    logger.Print("-- log init --")
+    logger.Print(time.Now())
 
-    n := node.NewNode(GetMyIP(), port)
+    n := node.NewNode(GetMyIP(), port, logger)
     n.Print()
     if initCluster {
         fmt.Println("Init cluster!")
@@ -88,4 +90,11 @@ func GetMyIP() net.IP {
     localAddr := conn.LocalAddr().(*net.UDPAddr)
 
     return localAddr.IP
+}
+
+func Parse() {
+    reader := bufio.NewReader(os.Stdin)
+    fmt.Print("Enter text: ")
+    text, _ := reader.ReadString('\n')
+    fmt.Println(text)
 }

@@ -11,48 +11,13 @@ import (
     "net"
     "errors"
     "sync"
+    lampartsclock "github.com/curusarn/distributed-system-hw/lampartsclock"
 )
 
 const heartbeatTimeout time.Duration = 10 * time.Second
 const retryDelay time.Duration = 100 * time.Millisecond
 const retryCount int = 3
 const initTtl int = 10
-
-type LampartsClock struct {
-    Time int64
-    Lock sync.RWMutex
-}
-
-func (c *LampartsClock) Get() int64 {
-    c.Lock.RLock()
-    defer c.Lock.RUnlock()
-    t := c.Time
-    return t
-}
-
-func (c *LampartsClock) GetAndInc() int64 {
-    c.Lock.RLock()
-    defer c.Lock.RUnlock()
-    c.Time++
-    t := c.Time
-    return t
-}
-
-func (c *LampartsClock) SetIfHigherAndInc(t int64) {
-    c.Lock.Lock()
-    defer c.Lock.Unlock()
-    if c.Time < t {
-        c.Time = t
-    }
-    c.Time++
-}
-
-func (c *LampartsClock) Inc() {
-    c.Lock.Lock()
-    defer c.Lock.Unlock()
-    c.Time++
-}
-
 
 type Msg interface {
     GetLogicalTime() int64
@@ -357,7 +322,7 @@ func Watch(r *NodeRpc) {
 type node struct {
     // const
     uid int64
-    addr string // socket addres
+    addr string // socket addres (ip:port)
 
     neighbourAddr string
     neighbourRpc *rpc.Client
@@ -371,7 +336,9 @@ type node struct {
     sharedVariable int
     // topologyBroken bool ??
 
-    logicalClock *LampartsClock
+    logicalClock *lampartsclock.LampartsClock
+
+    logger *log.Logger
 }
 
 func getUid(ip net.IP, port int) int64 {
@@ -391,12 +358,13 @@ func getIpPort(ip net.IP, port int) string {
     return ip.String() + ":" + strconv.Itoa(port)
 }
 
-func NewNode(ip net.IP, port int) node {
+func NewNode(ip net.IP, port int, logger *log.Logger) node {
     n := node {
         uid: getUid(ip, port),
         addr: getIpPort(ip, port),
         neighbourMtx: new(sync.RWMutex),
-        logicalClock: new(LampartsClock),
+        logicalClock: new(lampartsclock.LampartsClock),
+        logger: logger,
     }
     return n
 }
@@ -436,7 +404,7 @@ func (n *node) RUnlockMtx() {
 
 func (n *node) logPrint(str ...interface{}) {
     t := strconv.Itoa(int(n.logicalClock.Get()))
-    log.Print("|" + t + "| ", str)
+    n.logger.Print("|" + t + "| ", str)
 }
 
 func (n node) Print() {
@@ -469,7 +437,13 @@ func (n *node) DialNeighbour() {
     // TODO handle failed dials better
     client, err := rpc.DialHTTP("tcp", n.neighbourAddr)
     if err != nil {
-        log.Fatal("dialing:", err)
+        log.Fatal("Dialing neighbour ", n.neighbourAddr,
+                  " failed:", err)
+    }
+
+    if n.neighbourRpc != nil {
+        n.neighbourRpc.Close()
+        n.neighbourRpc = nil
     }
     n.neighbourRpc = client
 }
@@ -717,18 +691,6 @@ func (n node) FwdBroadcast(msg *VarMsg, reply *ReplyMsg) error {
 
 // more functions
 
-func (n *node) HeartbeatChecker() {
-    n.heartbeatTs = time.Now() // init
-    for {
-        time.Sleep(heartbeatTimeout)
-        ts := n.heartbeatTs
-        heartbeatExpiration := ts.Add(heartbeatTimeout)
-        if time.Now().After(heartbeatExpiration) {
-            n.Repair()
-        }
-    }
-}
-
 func (n *node) Listen() {
     r := &NodeRpc {
         Node: n,
@@ -744,7 +706,28 @@ func (n *node) Listen() {
     go http.Serve(l, nil)
 }
 
+func (n *node) HeartbeatChecker() {
+    n.heartbeatTs = time.Now() // init
+    for {
+        ts := n.heartbeatTs
+        heartbeatExpiration := ts.Add(heartbeatTimeout)
+        if time.Now().After(heartbeatExpiration) {
+            n.logPrint("Heartbeat expired at", heartbeatExpiration)
+            n.Repair()
+            continue
+        }
+        sleepDuration := heartbeatExpiration.Sub(time.Now())
+        n.logPrint("Sleeping for", sleepDuration)
+        time.Sleep(sleepDuration)
+    }
+}
 
+func (n *node) HeartbeatSender() {
+    for {
+        n.Heartbeat()
+        time.Sleep(5000 * time.Millisecond)
+    }
+}
 
 func (n *node) Run() {
     for {
@@ -754,6 +737,7 @@ func (n *node) Run() {
             time.Sleep(5000 * time.Millisecond)
         }
         n.PrintState()
+        n.Heartbeat()
         time.Sleep(5000 * time.Millisecond)
     }
 }

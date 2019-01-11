@@ -55,7 +55,6 @@ func main() {
     logger.Print(time.Now())
 
     n := node.NewNode(GetMyIP(), port, logger)
-    n.Print()
     n.Listen()
     if initCluster {
         fmt.Println("Init cluster!")
@@ -63,7 +62,7 @@ func main() {
         if err != nil {
             log.Fatal("InitCluster failed")
         }
-        ProcessStdin(&n)
+        ProcessStdin(n)
     } else if joinCluster != "" {
         fmt.Println("Join cluster:")
         fmt.Println(joinCluster)
@@ -71,7 +70,7 @@ func main() {
         if err != nil {
             log.Fatal("Join failed")
         }
-        ProcessStdin(&n)
+        ProcessStdin(n)
     } else {
         fmt.Println("Use --init-cluster or --join IP:port")
         flag.Usage()
@@ -99,11 +98,8 @@ func ProcessStdin(n node.Node) {
     var err error
     for {
         line, err = reader.ReadString('\n')
-
-        fmt.Printf(" > Read %d characters\n", len(line))
-        fmt.Println(" > > " + line)
         if err != nil {
-            fmt.Println(" > > ERR != nil")
+            fmt.Println("CMD ERR != nil")
 
             break
         }
@@ -112,12 +108,11 @@ func ProcessStdin(n node.Node) {
         // split by space (max 3 parts) 
         line = strings.TrimSuffix(line, "\n")
         slice := strings.SplitN(line, " ", 3)[:2]
-        fmt.Println(" > > ", slice)
         if len(slice) > 2 {
-            fmt.Println(" > > ERR: more than 2 words")
+            fmt.Println("CMD ERR: more than 2 words")
         }
         if len(slice) < 1 {
-            fmt.Println(" > > WARN: less than 1 word")
+            fmt.Println("CMD WARN: less than 1 word")
         }
         cmd := slice[0]
         var arg string
@@ -128,12 +123,12 @@ func ProcessStdin(n node.Node) {
 
     }
     if err != io.EOF {
-        fmt.Printf(" > Failed!: %v\n", err)
+        fmt.Println("CMD io ERROR:", err)
     }
 }
 
 func RunCmd(n node.Node, cmd string, arg string) error {
-    fmt.Println("Got command", cmd, "with arg", arg)
+    fmt.Println("CMD", cmd, arg)
     argPresent := (arg != "")
     var argValue, value int
     var err error
@@ -146,14 +141,14 @@ func RunCmd(n node.Node, cmd string, arg string) error {
     switch cmd {
     case "sleep":
         // sleep for 'arg' seconds
-        fmt.Println("CMD sleep", argValue)
+        //fmt.Println("CMD sleep", argValue)
         if argPresent == false {
             argValue = 1 // default arg 1
         }
         fmt.Println("Sleeping for", arg, "seconds")
         time.Sleep(time.Second * time.Duration(argValue))
     case "write":
-        fmt.Println("CMD write", argValue)
+        //fmt.Println("CMD write", argValue)
         if argPresent == false {
             argValue = 42 // default arg 42
         }
@@ -162,44 +157,53 @@ func RunCmd(n node.Node, cmd string, arg string) error {
             fmt.Println("Write failed!")
             return err
         }
-        fmt.Println("Written - sharedVariable =", value)
     case "read":
-        fmt.Println("CMD read")
+        //fmt.Println("CMD read")
         value, err = n.Read()
         if err != nil {
-            fmt.Println("Read failed!")
+            fmt.Println("CMD Read failed!")
             return err
         }
-        fmt.Println("Read - sharedVariable =", value)
+        fmt.Println("CMD Read sharedVariable =", value)
     case "leave":
         // leave properly
-        fmt.Println("CMD leave")
+        //fmt.Println("CMD leave")
         err = n.Leave()
         if err != nil {
-            fmt.Println("Leave failed!")
+            fmt.Println("CMD Leave failed!")
             return err
         }
-        fmt.Println("Left the cluster")
+        fmt.Println("CMD Leave successful")
+        //os.Exit(0)
     case "quit":
         // leave w/o message
-        fmt.Println("CMD quit")
+        //fmt.Println("CMD quit")
         n.LeaveWithoutMsg()
-        fmt.Println("Left the cluster without message")
+        fmt.Println("CMD Quit successful - left the cluster without message")
+        //os.Exit(0)
     case "join":
         // join the cluster
-        fmt.Println("CMD join")
-        err = n.Join(joinCluster)
-        if err != nil {
-            fmt.Println("Join failed!")
+        //fmt.Println("CMD join")
+        if joinCluster == "" {
+            fmt.Println("CMD Join failed - was initializing node!")
             return err
         }
-        fmt.Println("Left the cluster")
+        err = n.Join(joinCluster)
+        if err != nil {
+            fmt.Println("CMD Join failed!")
+            return err
+        }
+    case "info":
+        // print info
+        n.Print()
+        n.PrintState()
+        return nil
     case "":
-        fmt.Println("Skipping empty command")
+        fmt.Println("CMD Skipping empty command")
         return nil
     default:
-        fmt.Println("Can't process cmd", cmd)
-        return errors.New("Unrecognized command")
+        fmt.Println("CMD Can't process cmd", cmd)
+        return errors.New("CMD Unrecognized command")
     }
     return nil
 }

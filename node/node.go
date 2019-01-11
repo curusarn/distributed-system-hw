@@ -14,6 +14,7 @@ import (
     lampartsclock "github.com/curusarn/distributed-system-hw/lampartsclock"
 )
 
+const heartbeatInterval time.Duration = 7 * time.Second
 const heartbeatTimeout time.Duration = 10 * time.Second
 const retryDelay time.Duration = 100 * time.Millisecond
 const retryCount int = 3
@@ -131,18 +132,15 @@ func (r *NodeRpc) Join(msg AddrMsg, reply *NodeMsg) error {
     // what if I do not have a neighbour ?
     reply.Uid = r.Node.leaderUid // pass leader uid to joining node
 
-    func() {
-        r.Node.LockMtx()
-        defer r.Node.UnlockMtx()
+    err := r.Node.DialNeighbour(msg.Addr)
+    if err != nil {
+        err = errors.New("NodeRpc: Join request declined!")
+    } else {
         reply.Addr = r.Node.neighbourAddr
-        r.Node.neighbourAddr = msg.Addr
-        r.Node.DialNeighbour()
-    }()
+    }
 
-    // if dial fails set reply.neighbourAddr to ""
-    // or return error
     reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
-    return nil
+    return err
 }
 
 func (r *NodeRpc) Leave(msg TwoAddrMsg, reply *ReplyMsg) error {
@@ -156,17 +154,13 @@ func (r *NodeRpc) Leave(msg TwoAddrMsg, reply *ReplyMsg) error {
         return nil
     }
 
-    func() {
-        r.Node.LockMtx()
-        defer r.Node.UnlockMtx()
-        r.Node.neighbourAddr = msg.NewAddr
-        r.Node.DialNeighbour()
-        // if dial fails set reply.neighbourAddr to ""
-        // or return error
-    }()
+    err := r.Node.DialNeighbour(msg.NewAddr)
+    if err != nil {
+        err = errors.New("NodeRpc: Leave request declined!")
+    }
 
     reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
-    return nil
+    return err
 }
 
 func (r *NodeRpc) Repair(msg AddrMsg, reply *ReplyMsg) error {
@@ -177,20 +171,16 @@ func (r *NodeRpc) Repair(msg AddrMsg, reply *ReplyMsg) error {
 
     err := r.Node.FwdRepair(&msg, reply)
     if err != nil {
-        func() {
-            // failed FwdRepair -> we are the last node
-            r.Node.LockMtx()
-            defer r.Node.UnlockMtx()
-            r.Node.neighbourAddr = msg.Addr
-            r.Node.DialNeighbour()
-            // if dial fails set reply to false 
-            // or return error
-        }()
-
-        r.Node.logPrint("Topology Repaired")
+        // failed FwdRepair -> we are the last node
+        err := r.Node.DialNeighbour(msg.Addr)
+        if err != nil {
+            err = errors.New("NodeRpc: Repair request declined!")
+        } else {
+            r.Node.logPrint("Topology Repaired")
+        }
     }
     reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
-    return nil
+    return err
 }
 
 func (r *NodeRpc) Vote(msg UidMsg, reply *ReplyMsg) error {
@@ -250,7 +240,7 @@ func (r *NodeRpc) Read(msg UidMsg, reply *VarMsg) error {
         reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
-    err, value := r.Node.FwdRead(&msg, reply)
+    value, err := r.Node.FwdRead(&msg, reply)
     if err != nil {
         // handle errors
         r.Node.logPrint("ReadRpc error 8899")
@@ -318,6 +308,14 @@ func Watch(r *NodeRpc) {
 }
 
 // Node
+type Node interface {
+    InitCluster() error
+    Join(str string) error
+    Leave() error
+    LeaveWithoutMsg()
+    Read() (int, error)
+    Write(int) error
+}
 
 type node struct {
     // const
@@ -339,6 +337,8 @@ type node struct {
     logicalClock *lampartsclock.LampartsClock
 
     logger *log.Logger
+
+    leftTheCluster bool
 }
 
 func getUid(ip net.IP, port int) int64 {
@@ -365,6 +365,7 @@ func NewNode(ip net.IP, port int, logger *log.Logger) node {
         neighbourMtx: new(sync.RWMutex),
         logicalClock: new(lampartsclock.LampartsClock),
         logger: logger,
+        leftTheCluster: false,
     }
     return n
 }
@@ -419,33 +420,57 @@ func (n node) PrintState() {
     n.logPrint("logTime: ", strconv.Itoa(int(n.logicalClock.Get())))
 }
 
-func (n *node) InitCluster() {
-    n.LockMtx()
-    defer n.UnlockMtx()
+func (n *node) InitCluster() error {
+    n.sharedVariable = -1 // init sharedVariable to -1 
     n.leaderUid = n.uid // set yourself as leader
-    n.neighbourAddr = n.addr // set yourself as neighbour
-
-    n.sharedVariable = 420
-
-    n.Listen()
-    n.DialNeighbour()
+    err := n.DialNeighbour(n.addr) // set yourself as neighbour and dial
+    if err != nil {
+        n.logPrint("InitCluster error - can't connect to self - very wierd!")
+        return err
+    }
     // Abort if dial fails  
     // or return error
+
+    go n.HeartbeatChecker()
+    go n.HeartbeatSender()
+    return nil
 }
 
-func (n *node) DialNeighbour() {
-    // TODO handle failed dials better
-    client, err := rpc.DialHTTP("tcp", n.neighbourAddr)
+func (n *node) _dialNeighbour(addr string) (*rpc.Client, error) {
+    client, err := rpc.DialHTTP("tcp", addr)
     if err != nil {
-        log.Fatal("Dialing neighbour ", n.neighbourAddr,
-                  " failed:", err)
+        return client, err
+    }
+    n.logPrint("Dialing succes")
+    return client, err
+}
+
+func (n *node) DialNeighbour(newAddr string) error {
+    var client *rpc.Client
+    var err error
+    for i := 0; i < retryCount; i++ {
+        client, err = n._dialNeighbour(newAddr)
+        if err == nil {
+            break
+        }
+        // this will probably go away or become debug only
+        n.logPrint("_dialNeighbour error: ", err)
+        // multiple reply delays ?
+        time.Sleep(retryDelay)
+    }
+    if err != nil {
+        n.logPrint("Dialing neighbour ", newAddr,
+                   " failed:", err)
+        return err
     }
 
     if n.neighbourRpc != nil {
         n.neighbourRpc.Close()
         n.neighbourRpc = nil
     }
+    n.neighbourAddr = newAddr
     n.neighbourRpc = client
+    return nil
 }
 
 
@@ -514,8 +539,9 @@ func (n *node) _join(addr string, reply *NodeMsg) error {
     return client.Call("NodeRpc.Join", n.getNodeMsg(), reply)
 }
 
-func (n *node) Join(addr string) {
+func (n *node) Join(addr string) error {
     var reply NodeMsg
+    var err error
     for i := 0; i < retryCount; i++ {
         err := n._join(addr, &reply)
         if err == nil {
@@ -527,30 +553,42 @@ func (n *node) Join(addr string) {
         time.Sleep(retryDelay)
 
     }
+    if err != nil {
+        return err
+    }
     n.logicalClock.SetIfHigherAndInc(reply.GetLogicalTime())
     n.leaderUid = reply.Uid
 
     if reply.Addr == n.addr {
         // do not accept self as neighbour
         n.logPrint("Joined broken ring - expecting repair")
-        return
+        return nil
     }
 
-    n.LockMtx()
-    defer n.UnlockMtx()
-    n.neighbourAddr = reply.Addr
-    n.DialNeighbour()
+    err = n.DialNeighbour(reply.Addr)
+    if err != nil {
+        return err
+    }
+
+    go n.HeartbeatChecker()
+    go n.HeartbeatSender()
 
     n.logPrint("Joined")
+    return err
 }
 
-func (n node) Leave() {
+func (n node) LeaveWithoutMsg() {
+    n.leftTheCluster = true
+    n.logPrint("Left w/o message")
+}
+func (n node) Leave() error {
     var reply ReplyMsg
     msg := TwoAddrMsg {n.getAddrMsg(), n.neighbourAddr}
     n.logPrint("Sending Leave ", msg)
     err := n.SendMsg("Leave", &msg, &reply)
     if err != nil {
         n.logPrint("Leave error:", err)
+        return err
     }
 
     n.LockMtx()
@@ -558,7 +596,9 @@ func (n node) Leave() {
     n.neighbourAddr = ""
     n.neighbourRpc = nil
 
+    n.leftTheCluster = true
     n.logPrint("Left")
+    return nil
 }
 
 func (n node) FwdLeave(msg *TwoAddrMsg, reply *ReplyMsg) error {
@@ -634,9 +674,9 @@ func (n node) FwdElectedMsg(msg *UidMsg, reply *ReplyMsg) error {
 
 // Read Write Broadcast
 
-func (n *node) Read() (error, int) {
+func (n *node) Read() (int, error) {
     if n.leaderUid == n.uid {
-        return nil, n.sharedVariable
+        return n.sharedVariable, nil
     }
     var reply VarMsg
     msg := n.getUidMsg()
@@ -645,16 +685,16 @@ func (n *node) Read() (error, int) {
     if err != nil {
         n.logPrint("Read error: ", err)
     }
-    return err, reply.SharedVariable
+    return reply.SharedVariable, err
 }
 
-func (n *node) FwdRead(msg *UidMsg, reply *VarMsg) (error, int) {
+func (n *node) FwdRead(msg *UidMsg, reply *VarMsg) (int, error) {
     n.logPrint("Forwarding read ", msg)
     err := n.SendMsg("Read", msg, reply)
     if err == nil {
         n.sharedVariable = reply.SharedVariable
     }
-    return err, reply.SharedVariable
+    return reply.SharedVariable, err
 }
 
 func (n node) Write(value int) error {
@@ -704,11 +744,12 @@ func (n *node) Listen() {
         fmt.Println("listen error:", e)
     }
     go http.Serve(l, nil)
+    n.logPrint("Listenning on", n.addr)
 }
 
 func (n *node) HeartbeatChecker() {
     n.heartbeatTs = time.Now() // init
-    for {
+    for n.leftTheCluster == false {
         ts := n.heartbeatTs
         heartbeatExpiration := ts.Add(heartbeatTimeout)
         if time.Now().After(heartbeatExpiration) {
@@ -723,22 +764,20 @@ func (n *node) HeartbeatChecker() {
 }
 
 func (n *node) HeartbeatSender() {
-    for {
+    for n.leftTheCluster == false {
         n.Heartbeat()
-        time.Sleep(5000 * time.Millisecond)
+        time.Sleep(heartbeatInterval)
     }
 }
 
 func (n *node) Run() {
     for {
         for i := 0; i < 3; i++ {
-            n.logPrint("ready.")
-            n.Heartbeat()
-            time.Sleep(5000 * time.Millisecond)
+            time.Sleep(3000 * time.Millisecond)
         }
+        n.logPrint("ready.")
         n.PrintState()
-        n.Heartbeat()
-        time.Sleep(5000 * time.Millisecond)
+        time.Sleep(3000 * time.Millisecond)
     }
 }
 
@@ -752,7 +791,7 @@ func (n *node) RunLeave() {
             }
             n.PrintState()
             time.Sleep(5000 * time.Millisecond)
-            err, value := n.Read()
+            value, err := n.Read()
             if err != nil {
                 n.logPrint("Read failed")
             } else {

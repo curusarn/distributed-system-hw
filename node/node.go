@@ -139,8 +139,8 @@ func (r *NodeRpc) Join(msg AddrMsg, reply *NodeMsg) error {
     // what if I do not have a neighbour ?
     reply.Uid = r.Node.LeaderUid() // pass leader uid to joining node
 
-    reply.Addr = r.Node.neighbourAddr
-    err := r.Node.DialNeighbour(msg.Addr)
+    var err error
+    reply.Addr, err = r.Node.DialNeighbour(msg.Addr)
     if err != nil {
         r.Node.logPrint("NodeRpc: Join request declined!")
         err = errors.New("NodeRpc: Join request declined!")
@@ -165,7 +165,7 @@ func (r *NodeRpc) Leave(msg TwoAddrMsg, reply *ReplyMsg) error {
         return nil
     }
 
-    err := r.Node.DialNeighbour(msg.NewAddr)
+    _, err := r.Node.DialNeighbour(msg.NewAddr)
     if err != nil {
         r.Node.logPrint("NodeRpc: Leave request declined!")
         err = errors.New("NodeRpc: Leave request declined!")
@@ -186,13 +186,14 @@ func (r *NodeRpc) Repair(msg AddrMsg, reply *ReplyMsg) error {
 
     err := r.Node.FwdRepair(&msg, reply)
     if err != nil {
-        r.Node.logPrint("Topology Repaired")
+        err = nil
+        r.Node.logPrint("Reached loose end of ring")
         // failed FwdRepair -> we are the last node
-        err := r.Node.DialNeighbour(msg.Addr)
+        oldAddr, err := r.Node.DialNeighbour(msg.Addr)
         if err != nil {
             err = errors.New("NodeRpc: Repair request declined!")
         } else {
-            r.Node.logPrint("Topology Repaired")
+            r.Node.logPrint("Topology Repaired, lost node", oldAddr)
         }
     }
     reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
@@ -219,6 +220,8 @@ func (r *NodeRpc) Vote(msg UidMsg, reply *ReplyMsg) error {
         reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
+    r.Node.logPrint("Election done - I'm the leader")
+    r.Node.logPrint("Starting post-election - I'm the leader")
     // elected
     r.Node.SetLeaderUid(r.Node.uid)
     r.Node.SetInElection(false)
@@ -240,6 +243,9 @@ func (r *NodeRpc) ElectedMsg(msg UidMsg, reply *ReplyMsg) error {
         r.Node.FwdElectedMsg(&msg, reply)
         r.Node.SetLeaderUid(msg.Uid)
         r.Node.SetInElection(false)
+    } else {
+        r.Node.logPrint("Post-election done - I'm the leader")
+        r.Node.Broadcast()
     }
     reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return nil
@@ -517,7 +523,7 @@ func (n *node) InitCluster() error {
     //n.Listen()
     n.SetSharedVariable(-1) // init sharedVariable to -1 
     n.SetLeaderUid(n.uid) // set yourself as leader
-    err := n.DialNeighbour(n.addr) // set yourself as neighbour and dial
+    _, err := n.DialNeighbour(n.addr) // set yourself as neighbour and dial
     if err != nil {
         n.logPrint("InitCluster error - can't connect to self - very wierd!")
         return err
@@ -538,7 +544,9 @@ func (n *node) _dialNeighbour(addr string) (*rpc.Client, error) {
     return client, err
 }
 
-func (n *node) DialNeighbour(newAddr string) error {
+func (n *node) DialNeighbour(newAddr string) (string, error) {
+    n.LockMtx()
+    defer n.UnlockMtx()
     n.logPrint("Dialing", newAddr)
     var client *rpc.Client
     var err error
@@ -555,17 +563,18 @@ func (n *node) DialNeighbour(newAddr string) error {
     if err != nil {
         n.logPrint("Dialing neighbour ", newAddr,
                    " failed:", err)
-        return err
+        return "", err
     }
 
     if n.neighbourRpc != nil {
         n.neighbourRpc.Close()
         n.neighbourRpc = nil
     }
+    prev := n.neighbourAddr
     n.neighbourAddr = newAddr
     n.neighbourRpc = client
     n.logPrint("Dialing succes")
-    return nil
+    return prev, nil
 }
 
 
@@ -679,7 +688,7 @@ func (n *node) Join(addr string) error {
         return nil
     }
 
-    err = n.DialNeighbour(reply.Addr)
+    _, err = n.DialNeighbour(reply.Addr)
     if err != nil {
         return err
     }

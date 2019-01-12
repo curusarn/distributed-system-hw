@@ -16,13 +16,22 @@ import (
 )
 
 // send Heartbeat every
-const heartbeatInterval time.Duration = 3 * time.Second
-// require Heartbeat every
+const heartbeatInterval time.Duration = 5 * time.Second
+// send Reapir if you don't get Heartbeat for
 const heartbeatTimeout time.Duration = 10 * time.Second
+// shutdown if you don't get Heartbeat for
+const heartbeatTimeoutShutdown time.Duration = 25 * time.Second
+
 // how long to wait before retry
 const retryDelay time.Duration = 100 * time.Millisecond
 // how long to wait before retry if msg started election
 const retryDelayElection time.Duration = 3000 * time.Millisecond
+// how long to wait before retry if we have no neighbour
+//      long time because we are waiting for repair (and heartbeatTimeout)
+const retryDelayNoNeighbour time.Duration = 5000 * time.Millisecond
+// how long to wait before retry on failed join 
+const retryDelayJoin time.Duration = 3000 * time.Millisecond
+
 // how many times to retry  
 const retryCount int = 3
 // how many hops can message make before being discarded
@@ -136,10 +145,19 @@ func (r *NodeRpc) Join(msg AddrMsg, reply *NodeMsg) error {
     r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
 
     r.Node.logPrint("Recieved Join", msg.Addr)
-    // what if I do not have a neighbour ?
+
+    err := func() error {
+        r.Node.LockMtx()
+        if r.Node.neighbourAddr == "" {
+            return errors.New("NodeRpc: Join request declined!")
+        }
+        return nil
+    }()
+    if err != nil {
+        return err
+    }
     reply.Uid = r.Node.LeaderUid() // pass leader uid to joining node
 
-    var err error
     reply.Addr, err = r.Node.DialNeighbour(msg.Addr)
     if err != nil {
         r.Node.logPrint("NodeRpc: Join request declined!")
@@ -600,7 +618,7 @@ func (n node) SendMsg(method string, msg Msg, reply Msg) error {
     err = msg.DecTtl()
     if err != nil {
         // this will probably go away or become debug only
-        n.logPrint("SendMsg error: ", err)
+        n.logPrint("SendMsg error:", err)
         return err
     }
 
@@ -610,19 +628,21 @@ func (n node) SendMsg(method string, msg Msg, reply Msg) error {
             break
         }
         // this will probably go away or become debug only
-        n.logPrint("_sendMsg error: ", err)
-        // multiple reply delays ?
+        n.logPrint("_sendMsg error:", err)
+        // multiple reply delays based on error
         if strings.Contains(err.Error(), "Node: shutdown") {
             break
         } else if strings.Contains(err.Error(), "starting election") {
             time.Sleep(retryDelayElection)
+        } else if strings.Contains(err.Error(), "No neighbour: neighbourRpc == nil") {
+            break
         } else {
             time.Sleep(retryDelay)
         }
     }
     if err != nil {
         // this will probably go away or become debug only
-        n.logPrint("SendMsg error: ", err)
+        n.logPrint("SendMsg error:", err)
     }
     return err
 }
@@ -634,7 +654,7 @@ func (n node) Heartbeat() {
     var reply ReplyMsg
     err := n.SendMsg("Heartbeat", &msg, &reply)
     if err != nil {
-        n.logPrint("Heartbeat error: ", err)
+        n.logPrint("Heartbeat error:", err)
     }
 }
 
@@ -652,9 +672,8 @@ func (n *node) Join(addr string) error {
             break
         }
         // this will probably go away or become debug only
-        n.logPrint("_join dial error: ", err)
-        // multiple reply delays ?
-        time.Sleep(retryDelay)
+        n.logPrint("_join dial error:", err)
+        time.Sleep(retryDelayJoin)
 
     }
     if err != nil {
@@ -667,9 +686,8 @@ func (n *node) Join(addr string) error {
             break
         }
         // this will probably go away or become debug only
-        n.logPrint("_join call error: ", err)
-        // multiple reply delays ?
-        time.Sleep(retryDelay)
+        n.logPrint("_join call error:", err)
+        time.Sleep(retryDelayJoin)
 
     }
     if err != nil {
@@ -680,11 +698,12 @@ func (n *node) Join(addr string) error {
     n.SetLeaderUid(reply.Uid)
 
     if reply.Addr == "" {
-        log.Fatal("Got empty addr as reply w/o error.")
+        n.logPrint("Fatal: Got empty addr as reply w/o error.")
     }
     if reply.Addr == n.addr {
         // do not accept self as neighbour
         n.logPrint("Joined broken ring - expecting repair")
+        n.SetLeftTheCluster(false)
         return nil
     }
 
@@ -903,6 +922,16 @@ func (n *node) HeartbeatChecker() {
     for n.LeftTheCluster() == false {
         ts := n.HeartbeatTs()
         heartbeatExpiration := ts.Add(heartbeatTimeout)
+        heartbeatExpirationShutdown := ts.Add(heartbeatTimeoutShutdown)
+        if time.Now().After(heartbeatExpirationShutdown) {
+            n.logPrint("Heartbeat expired at", heartbeatExpiration)
+            n.logPrint("It's been too long - node is shuting down!")
+            err := n.Leave()
+            if err != nil {
+                n.LeaveWithoutMsg()
+            }
+            continue
+        }
         if time.Now().After(heartbeatExpiration) {
             n.logPrint("Heartbeat expired at", heartbeatExpiration)
             err := n.Repair()

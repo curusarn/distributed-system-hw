@@ -26,10 +26,6 @@ func main() {
 
     flag.StringVar(&joinCluster, "join", "",
                    "Join cluster on this IP:port")
-
-    var xxx bool
-    flag.BoolVar(&xxx, "xxx", false,
-                 "Node will do shit")
     flag.Parse()
 
     if flag.NArg() != 1 {
@@ -44,15 +40,15 @@ func main() {
         os.Exit(1)
     }
 
-    f, err := os.Open("dsv.log")
+    f, err := os.Create(logFile)
     if err != nil {
-        // fatal
+        fmt.Println("Error while creating log file:", err)
+        os.Exit(2)
     }
     mw := io.MultiWriter(os.Stdout, f)
     logger := log.New(mw, "", log.Ldate|log.Ltime)
     logger.SetOutput(mw)
     logger.Print("-- log init --")
-    logger.Print(time.Now())
 
     n := node.NewNode(GetMyIP(), port, logger)
     n.Listen()

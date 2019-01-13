@@ -153,21 +153,23 @@ func RunCmd(n node.Node, cmd string, arg string) error {
         //fmt.Println("CMD sleep", argValue)
         if argPresent == false {
             argValue = 1 // default arg 1
+            fmt.Println("CMD Sleep 1 (default argument)")
         }
         fmt.Println("CMD Sleeping for", arg, "seconds")
         time.Sleep(time.Second * time.Duration(argValue))
+        fmt.Println("CMD Sleep successful")
     case "write":
-        //fmt.Println("CMD write", argValue)
         if argPresent == false {
             argValue = 42 // default arg 42
+            fmt.Println("CMD Write 42 (default argument)")
         }
         err = n.Write(argValue)
         if err != nil {
             fmt.Println("CMD Write failed!")
             return err
         }
+        fmt.Println("CMD Write successful")
     case "read":
-        //fmt.Println("CMD read")
         value, err = n.Read()
         if err != nil {
             fmt.Println("CMD Read failed!")
@@ -176,7 +178,6 @@ func RunCmd(n node.Node, cmd string, arg string) error {
         fmt.Println("CMD Read sharedVariable =", value)
     case "leave":
         // leave properly
-        //fmt.Println("CMD leave")
         err = n.Leave()
         if err != nil {
             fmt.Println("CMD Leave failed!")
@@ -186,15 +187,13 @@ func RunCmd(n node.Node, cmd string, arg string) error {
         //os.Exit(0)
     case "quit":
         // leave w/o message
-        //fmt.Println("CMD quit")
         n.LeaveWithoutMsg()
         fmt.Println("CMD Quit successful - left the cluster without message")
         //os.Exit(0)
     case "join":
         // join the cluster
-        //fmt.Println("CMD join")
         if joinCluster == "" {
-            fmt.Println("CMD Join failed - was initializing node!")
+            fmt.Println("CMD Join failed - nowhere to join!")
             return err
         }
         err = n.Join(joinCluster)
@@ -211,7 +210,7 @@ func RunCmd(n node.Node, cmd string, arg string) error {
         fmt.Println("CMD Skipping empty command")
         return nil
     default:
-        fmt.Println("CMD Can't process cmd", cmd)
+        fmt.Println("CMD Unrecognized command", cmd)
         return errors.New("CMD Unrecognized command")
     }
     return nil

@@ -14,37 +14,39 @@ import (
     "sync/atomic"
     lampartsclock "github.com/curusarn/distributed-system-hw/lampartsclock"
 )
+const (
+    // send Heartbeat every
+    heartbeatInterval time.Duration = 5 * time.Second
+    // send Reapir if you don't get Heartbeat for
+    heartbeatTimeout time.Duration = 10 * time.Second
+    // shutdown if you don't get Heartbeat for
+    heartbeatTimeoutShutdown time.Duration = 25 * time.Second
 
-// send Heartbeat every
-const heartbeatInterval time.Duration = 5 * time.Second
-// send Reapir if you don't get Heartbeat for
-const heartbeatTimeout time.Duration = 10 * time.Second
-// shutdown if you don't get Heartbeat for
-const heartbeatTimeoutShutdown time.Duration = 25 * time.Second
+    // how long to wait before retry
+    retryDelay time.Duration = 100 * time.Millisecond
+    // how long to wait before retry if we have no neighbour
+    //      long time because we are waiting for repair (and heartbeatTimeout)
+    retryDelayNoNeighbour time.Duration = 5000 * time.Millisecond
+    // how long to wait before retry on failed join 
+    retryDelayJoin time.Duration = 3000 * time.Millisecond
 
-// how long to wait before retry
-const retryDelay time.Duration = 100 * time.Millisecond
-// how long to wait before retry if msg started election
-const retryDelayElection time.Duration = 5000 * time.Millisecond
-// how long to wait before retry if we have no neighbour
-//      long time because we are waiting for repair (and heartbeatTimeout)
-const retryDelayNoNeighbour time.Duration = 5000 * time.Millisecond
-// how long to wait before retry on failed join 
-const retryDelayJoin time.Duration = 3000 * time.Millisecond
+    // how many times to retry  
+    retryCount int = 3
+    // how many hops can message make before being discarded
+    // prevents messages from staying in the ring forver 
+    //      if recipient node leaves the ring
+    // NOTE: ttl has to be higher than number of nodes
+    initTtl int = 10
 
-// how many times to retry  
-const retryCount int = 3
-// how many hops can message make before being discarded
-// prevents messages from staying in the ring forver 
-//      if recipient node leaves the ring
-// NOTE: ttl has to be higher than number of nodes
-const initTtl int = 10
+    errNoNeighbourRpc string = "No neighbour - neighbourRpc == nil"
+    errNodeShutdown string = "Node is shut down"
+    errNoLeaderStartElection string = "No leader - start election"
+)
 
 type Msg interface {
     GetLogicalTime() int64
     SetLogicalTime(int64)
     DecTtl() error
-    StartedElection()
 }
 
 type ReplyMsg interface {
@@ -71,7 +73,6 @@ type TimeMsg struct {
 type BaseMsg struct {
     LogicalTime
     Ttl int
-    Election bool
 }
 
 func (m *BaseMsg) DecTtl() error {
@@ -80,10 +81,6 @@ func (m *BaseMsg) DecTtl() error {
         return errors.New("Message ttl is equal to zero")
     }
     return nil
-}
-
-func (m *BaseMsg) StartedElection() {
-    m.Election = true
 }
 
 func getBaseMsg() BaseMsg {
@@ -124,7 +121,7 @@ type NodeRpc struct {
 
 func (r *NodeRpc) Heartbeat(msg AddrMsg, reply *TimeMsg) error {
     if r.Node.LeftTheCluster() {
-        return errors.New("Node: shutdown")
+        return errors.New(errNodeShutdown)
     }
     r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
 
@@ -137,7 +134,7 @@ func (r *NodeRpc) Heartbeat(msg AddrMsg, reply *TimeMsg) error {
 
 func (r *NodeRpc) Join(msg AddrMsg, reply *NodeMsg) error {
     if r.Node.LeftTheCluster() {
-        return errors.New("Node: shutdown")
+        return errors.New(errNodeShutdown)
     }
     r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
 
@@ -169,11 +166,11 @@ func (r *NodeRpc) Join(msg AddrMsg, reply *NodeMsg) error {
 
 func (r *NodeRpc) Leave(msg TwoAddrMsg, reply *TimeMsg) error {
     if r.Node.LeftTheCluster() {
-        return errors.New("Node: shutdown")
+        return errors.New(errNodeShutdown)
     }
     r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
 
-    r.Node.logPrint("Recieved Leave", msg.Addr)
+    r.Node.logPrint("Recieved Leave from", msg.Addr)
     var err error
     if msg.Addr != r.Node.neighbourAddr {
         err = r.Node.FwdLeave(&msg, reply)
@@ -193,11 +190,11 @@ func (r *NodeRpc) Leave(msg TwoAddrMsg, reply *TimeMsg) error {
 
 func (r *NodeRpc) Repair(msg AddrMsg, reply *TimeMsg) error {
     if r.Node.LeftTheCluster() {
-        return errors.New("Node: shutdown")
+        return errors.New(errNodeShutdown)
     }
     r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
 
-    r.Node.logPrint("Recieved Repair", msg)
+    r.Node.logPrint("Recieved Repair for", msg.Addr)
     r.Node.logPrint("My neighbour is", r.Node.neighbourAddr)
 
     err := r.Node.FwdRepair(&msg, reply)
@@ -218,10 +215,10 @@ func (r *NodeRpc) Repair(msg AddrMsg, reply *TimeMsg) error {
 
 func (r *NodeRpc) Vote(msg UidMsg, reply *TimeMsg) error {
     if r.Node.LeftTheCluster() {
-        return errors.New("Node: shutdown")
+        return errors.New(errNodeShutdown)
     }
     r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
-    r.Node.logPrint("Recieved Vote", msg)
+    r.Node.logPrint("Recieved Vote for", msg.Uid)
 
     var err error
     if msg.Uid > r.Node.uid {
@@ -251,13 +248,13 @@ func (r *NodeRpc) Vote(msg UidMsg, reply *TimeMsg) error {
 
 func (r *NodeRpc) ElectedMsg(msg UidMsg, reply *TimeMsg) error {
     if r.Node.LeftTheCluster() {
-        return errors.New("Node: shutdown")
+        return errors.New(errNodeShutdown)
     }
     r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
-    r.Node.logPrint("Recieved ElectedMsg", msg)
+    r.Node.logPrint("Recieved ElectedMsg from", msg.Uid)
     r.Node.SetInElection(false)
 
-    var err error = nil
+    var err error
     if msg.Uid != r.Node.uid {
         r.Node.logPrint("ElectedMsg: Leader is", msg.Uid)
         err = r.Node.FwdElectedMsg(&msg, reply)
@@ -265,6 +262,7 @@ func (r *NodeRpc) ElectedMsg(msg UidMsg, reply *TimeMsg) error {
     } else {
         r.Node.logPrint("Post-election done - I'm the leader")
         go r.Node.Broadcast()
+        err = nil
     }
     reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
     return err
@@ -272,34 +270,23 @@ func (r *NodeRpc) ElectedMsg(msg UidMsg, reply *TimeMsg) error {
 
 func (r *NodeRpc) Read(msg UidMsg, reply *VarMsg) error {
     if r.Node.LeftTheCluster() {
-        return errors.New("Node: shutdown")
+        return errors.New(errNodeShutdown)
     }
     r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
-    r.Node.logPrint("Recieved Read", msg)
+    r.Node.logPrint("Recieved Read from", msg.Uid)
 
     if r.Node.leaderUid == r.Node.uid {
         r.Node.logPrint("Leader recieved Read")
         // i'm the leader
         reply.SharedVariable = r.Node.SharedVariable()
-        r.Node.Broadcast()
+        go r.Node.Broadcast()
         reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
     if msg.Uid == r.Node.uid {
-        if msg.Election {
-            // this msg already started election
-            r.Node.logPrint("No leader - election already started")
-            return errors.New("Read: No leader - election already started")
-        }
-        r.Node.logPrint("No leader - start election")
-        // full roundtrip
-        // start election by voting for self
-        err2 := r.Node.Vote()
-        if err2 != nil {
-            r.Node.logPrint("Read, Vote error:", err2)
-        }
+        r.Node.logPrint("Read: No leader - start election")
         reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
-        return errors.New("Read: No leader - starting election")
+        return errors.New(errNoLeaderStartElection)
     }
     value, err := r.Node.FwdRead(&msg, reply)
     if err == nil {
@@ -311,31 +298,23 @@ func (r *NodeRpc) Read(msg UidMsg, reply *VarMsg) error {
 
 func (r *NodeRpc) Write(msg VarMsg, reply *TimeMsg) error {
     if r.Node.LeftTheCluster() {
-        return errors.New("Node: shutdown")
+        return errors.New(errNodeShutdown)
     }
     r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
-    r.Node.logPrint("Recieved Write ", msg)
+    r.Node.logPrint("Recieved Write", msg.SharedVariable,"from", msg.Uid)
 
     if r.Node.leaderUid == r.Node.uid {
-        if msg.Election {
-            // this msg already started election
-            r.Node.logPrint("No leader - election already started")
-            return errors.New("Write: No leader - election already started")
-        }
         r.Node.logPrint("Leader recieved Write")
         // i'm the leader
         r.Node.sharedVariable = msg.SharedVariable
-        r.Node.Broadcast()
+        go r.Node.Broadcast()
         reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
         return nil
     }
     if msg.Uid == r.Node.uid {
-        r.Node.logPrint("No leader - starting election")
-        // full roundtrip
-        // start election by voting for self
-        r.Node.Vote()
+        r.Node.logPrint("Write: No leader - start election")
         reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
-        return errors.New("No leader - starting election")
+        return errors.New(errNoLeaderStartElection)
     }
     err := r.Node.FwdWrite(&msg, reply)
     reply.SetLogicalTime(r.Node.logicalClock.GetAndInc())
@@ -344,10 +323,10 @@ func (r *NodeRpc) Write(msg VarMsg, reply *TimeMsg) error {
 
 func (r *NodeRpc) Broadcast(msg VarMsg, reply *TimeMsg) error {
     if r.Node.LeftTheCluster() {
-        return errors.New("Node: shutdown")
+        return errors.New(errNodeShutdown)
     }
     r.Node.logicalClock.SetIfHigherAndInc(msg.GetLogicalTime())
-    r.Node.logPrint("Recieved Broadcast", msg)
+    r.Node.logPrint("Recieved Broadcast", msg.SharedVariable, "from", msg.Uid)
 
     if r.Node.leaderUid == r.Node.uid {
         r.Node.logPrint("Leader recieved Broadcast")
@@ -495,7 +474,7 @@ func NewNode(ip net.IP, port int, logger *log.Logger) *node {
 }
 
 func (n node) getBaseMsg() BaseMsg {
-    return BaseMsg {LogicalTime {0}, initTtl, false}
+    return BaseMsg {LogicalTime {0}, initTtl}
     // LogicalTime is being set in SendMsg()
 }
 
@@ -611,7 +590,7 @@ func (n *node) _sendMsg(method string, msg Msg, reply ReplyMsg) error {
     defer n.RUnlockMtx()
     if n.neighbourRpc == nil {
         // n.logPrint("No neighbourRpc")
-        return errors.New("No neighbour: neighbourRpc == nil")
+        return errors.New(errNoNeighbourRpc)
     }
     msg.SetLogicalTime(n.logicalClock.GetAndInc())
 
@@ -628,7 +607,7 @@ func (n *node) SendMsg(method string, msg Msg, reply ReplyMsg) error {
     err = msg.DecTtl()
     if err != nil {
         // this will probably go away or become debug only
-        n.logPrint("SendMsg error:", err)
+        //n.logPrint("SendMsg error:", err)
         return err
     }
 
@@ -638,24 +617,24 @@ func (n *node) SendMsg(method string, msg Msg, reply ReplyMsg) error {
             break
         }
         // this will probably go away or become debug only
-        n.logPrint("_sendMsg error:", err)
-        // multiple reply delays based on error
-        if strings.Contains(err.Error(), "Node: shutdown") {
-            break
-        } else if strings.Contains(err.Error(), "election") {
-            msg.StartedElection()
-            time.Sleep(retryDelayElection)
-        } else if strings.Contains(err.Error(),
-                                   "No neighbour: neighbourRpc == nil") {
-            break
-        } else {
+        //n.logPrint("_sendMsg error:", err)
+
+        switch err.Error() {
+        case errNodeShutdown:
+            return err
+        case errNoLeaderStartElection:
+            return err
+        case errNoNeighbourRpc:
+            return err
+        default:
+            //n.logPrint("SendMsg error:", err)
             time.Sleep(retryDelay)
         }
     }
-    if err != nil {
-        // this will probably go away or become debug only
-        n.logPrint("SendMsg error:", err)
-    }
+    // this will probably go away or become debug only
+    //if err != nil {
+    //    n.logPrint("SendMsg error:", err)
+    //}
     return err
 }
 
@@ -752,7 +731,7 @@ func (n *node) Leave() error {
     msg := TwoAddrMsg {n.getAddrMsg(), n.neighbourAddr}
     n.RUnlockMtx()
 
-    n.logPrint("Sending Leave ", msg)
+    n.logPrint("Sending Leave, neighbour:", msg.NewAddr)
     err := n.SendMsg("Leave", &msg, &reply)
     if err != nil {
         n.logPrint("Leave error:", err)
@@ -779,7 +758,7 @@ func (n *node) FwdLeave(msg *TwoAddrMsg, reply *TimeMsg) error {
 func (n *node) Repair() error {
     var reply TimeMsg
     msg := n.getAddrMsg()
-    n.logPrint("Sending Repair", msg)
+    n.logPrint("Sending Repair")
     err := n.SendMsg("Repair", &msg, &reply)
     if err != nil {
         n.logPrint("Repair error:", err)
@@ -796,12 +775,9 @@ func (n *node) FwdRepair(msg *AddrMsg, reply *TimeMsg) error {
 // Vote ElectedMsg
 
 func (n *node) Vote() error {
-    //if n.InElection() {
-    //    return errors.New("Node: can't Vote while InElection")
-    //}
     var reply TimeMsg
     msg := n.getUidMsg()
-    n.logPrint("Sending Vote", msg)
+    n.logPrint("Sending Vote for", msg.Uid)
     n.SetInElection(true)
     err := n.SendMsg("Vote", &msg, &reply)
     if err != nil {
@@ -822,7 +798,7 @@ func (n *node) FwdVote(msg *UidMsg, reply *TimeMsg) error {
 func (n *node) ElectedMsg() error {
     var reply TimeMsg
     msg := UidMsg {n.getBaseMsg(), n.uid}
-    n.logPrint("Sending ElectedMsg", msg)
+    n.logPrint("Sending ElectedMsg, uid:", msg.Uid)
 
     n.SetInElection(false)
     err := n.SendMsg("ElectedMsg", &msg, &reply)
@@ -849,10 +825,23 @@ func (n *node) Read() (int, error) {
     }
     var reply VarMsg
     msg := n.getUidMsg()
-    n.logPrint("Sending Read", msg)
+    n.logPrint("Sending Read")
     err := n.SendMsg("Read", &msg, &reply)
     if err != nil {
         n.logPrint("Read error: ", err)
+        if err.Error() == errNoLeaderStartElection {
+            err = n.Vote()
+            if err != nil {
+                n.logPrint("Vote failed", err)
+                return int(reply.SharedVariable), err
+            }
+            n.logPrint("Sending Read again", msg)
+            msg = n.getUidMsg()
+            err = n.SendMsg("Read", &msg, &reply)
+            if err != nil {
+                n.logPrint("Read again failed", err)
+            }
+        }
     }
     return int(reply.SharedVariable), err
 }
@@ -874,11 +863,23 @@ func (n *node) Write(value int) error {
     }
     var reply TimeMsg
     msg := VarMsg {n.getNodeMsg(), int32(value)}
-    n.logPrint("Sending Write", msg)
+    n.logPrint("Sending Write", msg.SharedVariable)
     err := n.SendMsg("Write", &msg, &reply)
     if err != nil {
         n.logPrint("Write error: ", err)
-        return err
+        if err.Error() == errNoLeaderStartElection {
+            err = n.Vote()
+            if err != nil {
+                n.logPrint("Vote failed", err)
+                return err
+            }
+            n.logPrint("Sending Write again", msg)
+            msg = VarMsg {n.getNodeMsg(), int32(value)}
+            err = n.SendMsg("Write", &msg, &reply)
+            if err != nil {
+                n.logPrint("Write again failed", err)
+            }
+        }
     }
     return err
 }
@@ -891,7 +892,7 @@ func (n *node) FwdWrite(msg *VarMsg, reply *TimeMsg) error {
 func (n *node) Broadcast() {
     var reply TimeMsg
     msg := VarMsg {n.getNodeMsg(), n.sharedVariable}
-    n.logPrint("Sending Broadcast", msg)
+    n.logPrint("Sending Broadcast", msg.SharedVariable)
     err := n.SendMsg("Broadcast", &msg, &reply)
     if err != nil {
         n.logPrint("Broadcast error: ", err)

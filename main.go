@@ -25,17 +25,30 @@ func main() {
                  " (takes precedence over join option)")
 
     flag.StringVar(&joinCluster, "join", "",
-                   "Join cluster on this IP:port")
+                   "Join cluster 'HOST:PORT'")
     flag.Parse()
 
+    flag.Usage = func() {
+        fmt.Println("USAGE:")
+        fmt.Println("      ./main PORT [--init-cluster] [--join HOST:PORT]")
+        fmt.Println("")
+        fmt.Println("POSITIONAL ARGUMENTS:")
+        fmt.Println("      PORT    Local port to listen on.")
+        fmt.Println("")
+        fmt.Println("OPTIONS:")
+        flag.PrintDefaults()
+
+    }
+
     if flag.NArg() != 1 {
+        fmt.Println("Error: Not enough arguments - please specify port.")
         flag.Usage()
         os.Exit(1)
     }
 
     port, err := strconv.Atoi(flag.Args()[0])
     if err != nil {
-        fmt.Print("Port has to be a number")
+        fmt.Print("Error: Port has to be a number")
         flag.Usage()
         os.Exit(1)
     }
@@ -48,30 +61,29 @@ func main() {
     mw := io.MultiWriter(os.Stdout, f)
     logger := log.New(mw, "", log.Ldate|log.Ltime)
     logger.SetOutput(mw)
-    logger.Print("-- log init --")
+    logger.Print("==== log init ====")
 
     n := node.NewNode(GetMyIP(), port, logger)
     n.Listen()
     if initCluster {
-        fmt.Println("Init cluster!")
+        logger.Print("Initializing cluster!")
         err := n.InitCluster()
         if err != nil {
-            log.Fatal("InitCluster failed")
+            logger.Fatal("Fatal: Initializing cluster failed")
         }
         ProcessStdin(n)
     } else if joinCluster != "" {
-        fmt.Println("Join cluster:")
-        fmt.Println(joinCluster)
+        logger.Print("Joining cluster", joinCluster)
         err := n.Join(joinCluster)
         if err != nil {
-            log.Fatal("Join failed")
+            logger.Fatal("Fatal: Joining failed")
         }
         ProcessStdin(n)
     } else {
-        fmt.Println("Use --init-cluster or --join IP:port")
+        fmt.Println("Error: Use '--init-cluster' or '--join IP:PORT' option")
         flag.Usage()
+        os.Exit(1)
     }
-
 
 }
 

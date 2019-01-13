@@ -64,16 +64,18 @@ func main() {
     logger.Print("==== log init ====")
 
     n := node.NewNode(GetMyIP(), port, logger)
-    n.Listen()
+    n.Print()
     if initCluster {
         logger.Print("Initializing cluster!")
+        n.Listen()
         err := n.InitCluster()
         if err != nil {
             logger.Fatal("Fatal: Initializing cluster failed")
         }
         ProcessStdin(n)
     } else if joinCluster != "" {
-        logger.Print("Joining cluster", joinCluster)
+        logger.Print("Joining cluster ", joinCluster)
+        n.Listen()
         err := n.Join(joinCluster)
         if err != nil {
             logger.Fatal("Fatal: Joining failed")
@@ -107,8 +109,7 @@ func ProcessStdin(n node.Node) {
     for {
         line, err = reader.ReadString('\n')
         if err != nil {
-            fmt.Println("CMD ERR != nil")
-
+            //fmt.Println("CMD ERR != nil")
             break
         }
 
@@ -153,7 +154,7 @@ func RunCmd(n node.Node, cmd string, arg string) error {
         if argPresent == false {
             argValue = 1 // default arg 1
         }
-        fmt.Println("Sleeping for", arg, "seconds")
+        fmt.Println("CMD Sleeping for", arg, "seconds")
         time.Sleep(time.Second * time.Duration(argValue))
     case "write":
         //fmt.Println("CMD write", argValue)
@@ -162,7 +163,7 @@ func RunCmd(n node.Node, cmd string, arg string) error {
         }
         err = n.Write(argValue)
         if err != nil {
-            fmt.Println("Write failed!")
+            fmt.Println("CMD Write failed!")
             return err
         }
     case "read":

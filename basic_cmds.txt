@@ -1,0 +1,15 @@
+sleep 15
+read
+sleep 15
+write 999
+sleep 15 
+leave
+sleep 30
+join
+sleep 15
+read
+sleep 15
+read
+sleep 15
+quit
+

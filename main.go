@@ -26,6 +26,8 @@ func main() {
 
     flag.StringVar(&joinCluster, "join", "",
                    "Join cluster 'HOST:PORT'")
+    var ip string
+    flag.StringVar(&ip, "ip", "", "IP address")
     flag.Parse()
 
     flag.Usage = func() {
@@ -63,7 +65,13 @@ func main() {
     logger.SetOutput(mw)
     logger.Print("==== log init ====")
 
-    n := node.NewNode(GetMyIP(), port, logger)
+    var ipAddr net.IP
+    if ip != "" {
+        ipAddr = net.ParseIP(ip)
+    } else {
+        ipAddr = GetMyIP()
+    }
+    n := node.NewNode(ipAddr, port, logger)
     n.Print()
     if initCluster {
         logger.Print("Initializing cluster!")

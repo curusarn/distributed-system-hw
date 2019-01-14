@@ -3,6 +3,7 @@ Vagrant.configure("2") do |config|
     config.vm.synced_folder ".", "/vagrant", disabled: true
     config.vm.box = "ubuntu/trusty64"
     config.vm.provision "file", source: "main", destination: "main"
+    config.vm.provision "file", source: "Makefile", destination: "Makefile"
     
     config.vm.define "dsv1" do |dsv| 
         dsv.vm.network "private_network", ip: "192.168.0.11"
@@ -19,5 +20,9 @@ Vagrant.configure("2") do |config|
     config.vm.define "dsv4" do |dsv| 
         dsv.vm.network "private_network", ip: "192.168.0.14"
         dsv.vm.hostname = "dsv4"
+    end
+    config.vm.define "dsv5" do |dsv| 
+        dsv.vm.network "private_network", ip: "192.168.0.15"
+        dsv.vm.hostname = "dsv5"
     end
 end

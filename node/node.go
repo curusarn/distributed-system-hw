@@ -450,8 +450,9 @@ func (n *node) SetLeftTheCluster(value bool) {
 
 func getUid(ip net.IP, port int) int64 {
     var uid int64 = 0
-    for _, ipPart := range ip {
-        uid += int64(ipPart)
+    for _, ipPart := range strings.Split(ip.String(), ".") {
+        ipPartInt, _ := strconv.Atoi(ipPart)
+        uid += int64(ipPartInt)
         uid *= 1000
     }
     uid *= 1000

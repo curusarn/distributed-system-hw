@@ -16,5 +16,8 @@ It is a simple distributed system that mainatains a shared variable.
 - Uses GoRPC for message sending
 
 Run 5 node cluster using Vagrant like this:  
-1) `vagrant up` - creates 5 virtual machines
-2) Run on each machine: `make dsvX` (replace X with machine number)
+1) Compile the project with `make build`
+1) Create 5 virtual machines with `vagrant up`
+1) For each machine (`dsv1`, `dsv2`, `dsv3`, `dsv4`, `dsv5`):
+    - Connect to machine with `vagrant ssh dsvX`
+    - Run with `make dsvX`

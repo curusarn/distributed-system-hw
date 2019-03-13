@@ -14,3 +14,10 @@ It is a simple distributed system that mainatains a shared variable.
   - Log messages have logical clock timestamp
 - Written in Golang
 - Uses GoRPC for message sending
+
+Run 5 node cluster using Vagrant like this:  
+1) `make dsv1`  
+2) `make dsv2`  
+3) `make dsv3`  
+4) `make dsv4`
+5) `make dsv5`  
